@@ -13,8 +13,8 @@ from blackjax.smc import base as smc_base
 from blackjax.smc import resampling  # reuse existing schemes
 
 
-class ABCSMCState(NamedTuple):
-    """Current state of the ABC-SMC sampler."""
+class SMCABCState(NamedTuple):
+    """Current state of the SMC-ABC sampler."""
 
     particles: ArrayTree
     weights: Array  # shape (N,)
@@ -23,8 +23,8 @@ class ABCSMCState(NamedTuple):
     num_mcmc_moves: int
 
 
-class ABCSMCInfo(NamedTuple):
-    """Information about the ABC-SMC sampler."""
+class SMCABCInfo(NamedTuple):
+    """Information about the SMC-ABC sampler."""
 
     ancestors: Array  # indices selected by resampling
     acceptance_rate: float  # mean acceptance in the MCMC move
@@ -52,23 +52,23 @@ def _make_weight_fn(
 
 def init(
     particles: ArrayLikeTree, epsilon: float, distance_fn: Callable[[ArrayTree], Array]
-) -> ABCSMCState:
-    """Create an initial `ABCSMCState`."""
+) -> SMCABCState:
+    """Create an initial `SMCABCState`."""
     flat_particles = jax.tree_util.tree_leaves(particles)[0]
     num_particles = flat_particles.shape[0]
 
     distances = distance_fn(particles)
     weights = jnp.ones(num_particles) / num_particles
-    return ABCSMCState(particles, weights, epsilon, distances, num_mcmc_moves=0)
+    return SMCABCState(particles, weights, epsilon, distances, num_mcmc_moves=0)
 
 
-def step() -> tuple[ABCSMCState, ABCSMCInfo]:
-    # TODO: implement the ABC-SMC step
+def step() -> tuple[SMCABCState, SMCABCInfo]:
+    # TODO: implement the SMC ABC step
     return None, None
 
 
 # TODO: see if this belongs in a different file
-def abc_smc(
+def smc_abc(
     *,
     simulate_fn: Callable[[PRNGKey, ArrayTree], ArrayTree],
     summary_fn: Callable[[ArrayTree], ArrayTree] = lambda x: x,
@@ -99,7 +99,7 @@ def abc_smc(
         del rng_key
         return init(initial_particles, epsilon, distance_fn)
 
-    def _step_fn(rng_key: PRNGKey, state: ABCSMCState):
+    def _step_fn(rng_key: PRNGKey, state: SMCABCState):
         return step(
             rng_key,
             state,
