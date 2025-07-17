@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Callable, NamedTuple, Optional, Tuple
+from typing import Callable, NamedTuple, Optional
 
 import jax
 import jax.numpy as jnp
 from jax import Array
 
 from blackjax.types import ArrayLikeTree, ArrayTree, PRNGKey
-from blackjax.smc import base as smc_base
 from blackjax.smc import resampling  # reuse existing schemes
 
 
@@ -52,18 +51,27 @@ def _make_weight_fn(
 
 
 def init(
+    key: PRNGKey,
     particles: ArrayLikeTree,
     epsilon: float,
     distance_fn: Callable[[ArrayTree], Array],
+    simulate_fn: Optional[Callable[[PRNGKey, ArrayTree], ArrayTree]],
     *,
     initial_R: int = 1,
 ) -> SMCABCState:
     """Create an initial `SMCABCState`."""
+    # TODO: eps_1 tolerance ?
     first_leaf, *_ = jax.tree_util.tree_leaves(particles)
     N = first_leaf.shape[0]
 
-    distances = jax.vmap(distance_fn)(particles)
+    key, subkey = jax.random.split(key)
+    sim_keys = jax.random.split(subkey, N)  # (N,)
+    sims = jax.vmap(simulate_fn)(sim_keys, particles)  # (N, 2)
+    distances = jax.vmap(distance_fn)(sims)  # (N,)
     weights = jnp.ones(N) / N  # uniform at t = 0
+
+    distances = jnp.squeeze(distances)  # shape (N,)
+    weights = jnp.squeeze(weights)  # shape (N,)
 
     return SMCABCState(
         particles=particles,
@@ -85,6 +93,7 @@ def _batched_distance(particles, simulate_fn, distance_fn):
 
 
 def _rw_proposal(rng_key, theta, chol_S):
+    # TODO: Note: could make more general / could be user-defined
     step = jax.random.normal(rng_key, theta.shape) @ chol_S.T
     return theta + step
 
@@ -99,6 +108,7 @@ def abc_step(
     *,
     simulate_fn: Callable[[PRNGKey, ArrayTree], ArrayTree],
     distance_fn: Callable[[ArrayTree], float],
+    prior_logpdf: Callable[[ArrayTree], float],
     alpha: float = 0.5,
     c: float = 0.01,
     resampling_fn: Callable = resampling.systematic,
@@ -136,9 +146,19 @@ def abc_step(
     )  # (Na, R_cur, 2)
 
     def mh_one(key, theta_old):
-        theta_prop = _rw_proposal(key, theta_old, chol_S)
-        rho_prop = distance_fn(simulate_fn(key, theta_prop))
-        accept = rho_prop <= epsilon_next
+        key_prop, key_sim, key_u = jax.random.split(key, 3)
+        theta_prop = _rw_proposal(key_prop, theta_old, chol_S)
+        rho_prop = distance_fn(simulate_fn(key_sim, theta_prop))
+
+        # NOTE: proposal not included as symmetric, if make general later need to add this in
+        log_alpha = jnp.where(
+            rho_prop <= epsilon_next,
+            prior_logpdf(theta_prop) - prior_logpdf(theta_old),
+            -jnp.inf,
+        )
+        u = jax.random.uniform(key_u)
+        accept = jnp.log(u) < jnp.minimum(0.0, log_alpha)
+
         theta_new = jnp.where(accept, theta_prop, theta_old)
         return theta_new, accept
 
@@ -189,49 +209,49 @@ def abc_step(
     return new_state, info
 
 
-# TODO: see if this belongs in a different file
-def smc_abc(
-    *,
-    simulate_fn: Callable[[PRNGKey, ArrayTree], ArrayTree],
-    summary_fn: Callable[[ArrayTree], ArrayTree] = lambda x: x,
-    distance: str | Callable[[ArrayTree], Array] = "euclidean",
-    alpha: float = 0.5,
-    resampling_fn: Callable = resampling.systematic,
-    **mcmc_kwargs,
-):
-    """
-    Return a `blackjax.base.SamplingAlgorithm` instance whose ``init/step`` follow the
-    ABC‑SMC replenishment scheme.
+# # TODO: see if this belongs in a different file
+# def smc_abc(
+#     *,
+#     simulate_fn: Callable[[PRNGKey, ArrayTree], ArrayTree],
+#     summary_fn: Callable[[ArrayTree], ArrayTree] = lambda x: x,
+#     distance: str | Callable[[ArrayTree], Array] = "euclidean",
+#     alpha: float = 0.5,
+#     resampling_fn: Callable = resampling.systematic,
+#     **mcmc_kwargs,
+# ):
+#     """
+#     Return a `blackjax.base.SamplingAlgorithm` instance whose ``init/step`` follow the
+#     ABC‑SMC replenishment scheme.
 
-    Parameters mirror those of :func:`step`; they are **closed over** in the returned object.
-    """
+#     Parameters mirror those of :func:`step`; they are **closed over** in the returned object.
+#     """
 
-    # Map string → actual distance function ---------------------------------
-    if isinstance(distance, str):
-        if distance.lower() == "euclidean":
-            distance_fn = lambda sims: jnp.linalg.norm(
-                summary_fn(sims) - obs_summary, axis=-1
-            )
-        else:
-            raise ValueError(f"Unknown built‑in distance '{distance}'")
-    else:
-        distance_fn = distance
+#     # Map string → actual distance function ---------------------------------
+#     if isinstance(distance, str):
+#         if distance.lower() == "euclidean":
+#             distance_fn = lambda sims: jnp.linalg.norm(
+#                 summary_fn(sims) - obs_summary, axis=-1
+#             )
+#         else:
+#             raise ValueError(f"Unknown built‑in distance '{distance}'")
+#     else:
+#         distance_fn = distance
 
-    def _init_fn(initial_particles: ArrayLikeTree, epsilon: float, *, rng_key=None):
-        del rng_key
-        return init(initial_particles, epsilon, distance_fn)
+#     def _init_fn(initial_particles: ArrayLikeTree, epsilon: float, *, rng_key=None):
+#         del rng_key
+#         return init(initial_particles, epsilon, distance_fn)
 
-    def _step_fn(rng_key: PRNGKey, state: SMCABCState):
-        return abc_step(
-            rng_key,
-            state,
-            simulate_fn=simulate_fn,
-            distance_fn=distance_fn,
-            alpha=alpha,
-            resampling_fn=resampling_fn,
-            **mcmc_kwargs,
-        )
+#     def _step_fn(rng_key: PRNGKey, state: SMCABCState):
+#         return abc_step(
+#             rng_key,
+#             state,
+#             simulate_fn=simulate_fn,
+#             distance_fn=distance_fn,
+#             alpha=alpha,
+#             resampling_fn=resampling_fn,
+#             **mcmc_kwargs,
+#         )
 
-    from blackjax.base import SamplingAlgorithm
+#     from blackjax.base import SamplingAlgorithm
 
-    return SamplingAlgorithm(_init_fn, _step_fn)
+#     return SamplingAlgorithm(_init_fn, _step_fn)
