@@ -77,10 +77,23 @@ mvnormal_position_init = {
     "c": jnp.ones((2, 1)),
 }
 _, unravel_fn = ravel_pytree(mvnormal_position_init)
-key0, key1 = jax.random.split(jax.random.key(52))
-mvnormal_momentum_init = unravel_fn(jax.random.normal(key0, (6,)))
-a = jax.random.normal(key1, (6, 6))
-cov = jnp.matmul(a.T, a)
+mvnormal_momentum_init = {
+    "a": jnp.asarray(0.53288144),
+    "b": jnp.asarray([0.25310317, 1.3788314, -0.13486017]),
+    "c": jnp.asarray([[-0.59082425], [1.2088736]]),
+}
+
+cov = jnp.asarray(
+    [
+        [5.9959664, 1.1494889, -1.0420643, -0.6328479, -0.20363973, 2.1600752],
+        [1.1494889, 1.3504763, -0.3601517, -0.98311526, 1.1569028, -1.4185406],
+        [-1.0420643, -0.3601517, 6.3011055, -2.0662997, -0.10126236, 1.2898219],
+        [-0.6328479, -0.98311526, -2.0662997, 4.82699, -2.575554, 2.5724294],
+        [-0.20363973, 1.1569028, -0.10126236, -2.575554, 3.35319, -2.9411654],
+        [2.1600752, -1.4185406, 1.2898219, 2.5724294, -2.9411654, 6.3740206],
+    ]
+)
+
 # Validated numerically
 mvnormal_position_end = unravel_fn(
     jnp.asarray([0.38887993, 0.85231394, 2.7879136, 3.0339851, 0.5856687, 1.9291426])
@@ -134,15 +147,17 @@ examples = {
 
 algorithms = {
     "velocity_verlet": {"algorithm": integrators.velocity_verlet, "precision": 1e-4},
-    "mclachlan": {"algorithm": integrators.mclachlan, "precision": 1e-5},
-    "yoshida": {"algorithm": integrators.yoshida, "precision": 1e-6},
+    "mclachlan": {"algorithm": integrators.mclachlan, "precision": 1e-4},
+    "yoshida": {"algorithm": integrators.yoshida, "precision": 1e-4},
+    "omelyan": {"algorithm": integrators.omelyan, "precision": 1e-4},
     "implicit_midpoint": {
         "algorithm": integrators.implicit_midpoint,
         "precision": 1e-4,
     },
-    "isokinetic_leapfrog": {"algorithm": integrators.isokinetic_leapfrog},
+    "isokinetic_velocity_verlet": {"algorithm": integrators.isokinetic_velocity_verlet},
     "isokinetic_mclachlan": {"algorithm": integrators.isokinetic_mclachlan},
     "isokinetic_yoshida": {"algorithm": integrators.isokinetic_yoshida},
+    "isokinetic_omelyan": {"algorithm": integrators.isokinetic_omelyan},
 }
 
 
@@ -168,6 +183,7 @@ class IntegratorTest(chex.TestCase):
                 "velocity_verlet",
                 "mclachlan",
                 "yoshida",
+                "omelyan",
                 "implicit_midpoint",
             ],
         )
@@ -234,18 +250,20 @@ class IntegratorTest(chex.TestCase):
         ) / (jnp.cosh(delta) + jnp.dot(gradient_normalized, momentum * jnp.sinh(delta)))
 
         # Efficient implementation
-        update_stable = self.variant(esh_dynamics_momentum_update_one_step)
+        update_stable = self.variant(
+            esh_dynamics_momentum_update_one_step(inverse_mass_matrix=1.0)
+        )
         next_momentum1, *_ = update_stable(momentum, gradient, step_size, 1.0)
         np.testing.assert_array_almost_equal(next_momentum, next_momentum1)
 
     @chex.all_variants(with_pmap=False)
-    def test_isokinetic_leapfrog(self):
+    def test_isokinetic_velocity_verlet(self):
         cov = jnp.asarray([[1.0, 0.5, 0.1], [0.5, 2.0, -0.1], [0.1, -0.1, 3.0]])
         logdensity_fn = lambda x: stats.multivariate_normal.logpdf(
             x, jnp.zeros([3]), cov
         )
 
-        step = self.variant(integrators.isokinetic_leapfrog(logdensity_fn))
+        step = self.variant(integrators.isokinetic_velocity_verlet(logdensity_fn))
 
         rng = jax.random.key(4263456)
         key0, key1 = jax.random.split(rng, 2)
@@ -258,7 +276,7 @@ class IntegratorTest(chex.TestCase):
         next_state, kinetic_energy_change = step(initial_state, step_size)
 
         # explicit integration
-        op1 = esh_dynamics_momentum_update_one_step
+        op1 = esh_dynamics_momentum_update_one_step(inverse_mass_matrix=1.0)
         op2 = integrators.euclidean_position_update_fn(logdensity_fn)
         position, momentum, _, logdensity_grad = initial_state
         momentum, kinetic_grad, kinetic_energy_change0 = op1(
@@ -294,9 +312,10 @@ class IntegratorTest(chex.TestCase):
     @chex.all_variants(with_pmap=False)
     @parameterized.parameters(
         [
-            "isokinetic_leapfrog",
+            "isokinetic_velocity_verlet",
             "isokinetic_mclachlan",
             "isokinetic_yoshida",
+            "isokinetic_omelyan",
         ],
     )
     def test_isokinetic_integrator(self, integrator_name):

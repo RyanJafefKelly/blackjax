@@ -6,7 +6,7 @@ import jax.numpy as jnp
 import jax.scipy.stats as stats
 from absl.testing import absltest
 
-from blackjax.vi.schrodinger_follmer import schrodinger_follmer
+from blackjax.vi.schrodinger_follmer import as_top_level_api as schrodinger_follmer
 
 
 class SchrodingerFollmerTest(chex.TestCase):
@@ -51,7 +51,7 @@ class SchrodingerFollmerTest(chex.TestCase):
 
         # Simulate the data
         observed = jax.random.multivariate_normal(
-            rng_key_observed, true_mu, true_cov, shape=(10_000,)
+            rng_key_observed, true_mu, true_cov, shape=(25,)
         )
 
         logp_model = functools.partial(

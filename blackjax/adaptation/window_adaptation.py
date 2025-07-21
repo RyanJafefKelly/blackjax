@@ -12,13 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Implementation of the Stan warmup for the HMC family of sampling algorithms."""
-from typing import Callable, NamedTuple, Union
+from typing import Callable, NamedTuple
 
 import jax
 import jax.numpy as jnp
 
 import blackjax.mcmc as mcmc
-from blackjax.adaptation.base import AdaptationInfo, AdaptationResults
+from blackjax.adaptation.base import AdaptationResults, return_all_adapt_info
 from blackjax.adaptation.mass_matrix import (
     MassMatrixAdaptationState,
     mass_matrix_adaptation,
@@ -28,7 +28,7 @@ from blackjax.adaptation.step_size import (
     dual_averaging_adaptation,
 )
 from blackjax.base import AdaptationAlgorithm
-from blackjax.progress_bar import progress_bar_scan
+from blackjax.progress_bar import gen_scan_fn
 from blackjax.types import Array, ArrayLikeTree, PRNGKey
 from blackjax.util import pytree_size
 
@@ -243,16 +243,18 @@ def base(
 
 
 def window_adaptation(
-    algorithm: Union[mcmc.hmc.hmc, mcmc.nuts.nuts],
+    algorithm,
     logdensity_fn: Callable,
     is_mass_matrix_diagonal: bool = True,
     initial_step_size: float = 1.0,
     target_acceptance_rate: float = 0.80,
     progress_bar: bool = False,
+    adaptation_info_fn: Callable = return_all_adapt_info,
+    integrator=mcmc.integrators.velocity_verlet,
     **extra_parameters,
 ) -> AdaptationAlgorithm:
     """Adapt the value of the inverse mass matrix and step size parameters of
-    algorithms in the HMC fmaily.
+    algorithms in the HMC fmaily. See Blackjax.hmc_family
 
     Algorithms in the HMC family on a euclidean manifold depend on the value of
     at least two parameters: the step size, related to the trajectory
@@ -279,6 +281,11 @@ def window_adaptation(
         The acceptance rate that we target during step size adaptation.
     progress_bar
         Whether we should display a progress bar.
+    adaptation_info_fn
+        Function to select the adaptation info returned. See return_all_adapt_info
+        and get_filter_adapt_info_fn in blackjax.adaptation.base.  By default all
+        information is saved - this can result in excessive memory usage if the
+        information is unused.
     **extra_parameters
         The extra parameters to pass to the algorithm, e.g. the number of
         integration steps for HMC.
@@ -289,7 +296,7 @@ def window_adaptation(
 
     """
 
-    mcmc_kernel = algorithm.build_kernel()
+    mcmc_kernel = algorithm.build_kernel(integrator)
 
     adapt_init, adapt_step, adapt_final = base(
         is_mass_matrix_diagonal,
@@ -317,7 +324,7 @@ def window_adaptation(
 
         return (
             (new_state, new_adaptation_state),
-            AdaptationInfo(new_state, info, new_adaptation_state),
+            adaptation_info_fn(new_state, info, new_adaptation_state),
         )
 
     def run(rng_key: PRNGKey, position: ArrayLikeTree, num_steps: int = 1000):
@@ -326,17 +333,16 @@ def window_adaptation(
 
         if progress_bar:
             print("Running window adaptation")
-            one_step_ = jax.jit(progress_bar_scan(num_steps)(one_step))
-        else:
-            one_step_ = jax.jit(one_step)
-
+        scan_fn = gen_scan_fn(num_steps, progress_bar=progress_bar)
+        start_state = (init_state, init_adaptation_state)
         keys = jax.random.split(rng_key, num_steps)
         schedule = build_schedule(num_steps)
-        last_state, info = jax.lax.scan(
-            one_step_,
-            (init_state, init_adaptation_state),
+        last_state, info = scan_fn(
+            one_step,
+            start_state,
             (jnp.arange(num_steps), keys, schedule),
         )
+
         last_chain_state, last_warmup_state, *_ = last_state
 
         step_size, inverse_mass_matrix = adapt_final(last_warmup_state)

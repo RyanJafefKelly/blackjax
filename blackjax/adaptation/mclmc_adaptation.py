@@ -20,7 +20,7 @@ import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
 
 from blackjax.diagnostics import effective_sample_size
-from blackjax.util import pytree_size
+from blackjax.util import generate_unit_vector, incremental_value_update, pytree_size
 
 
 class MCLMCAdaptationState(NamedTuple):
@@ -30,10 +30,13 @@ class MCLMCAdaptationState(NamedTuple):
         The momentum decoherent rate for the MCLMC algorithm.
     step_size
         The step size used for the MCLMC algorithm.
+    inverse_mass_matrix
+        A matrix used for preconditioning.
     """
 
     L: float
     step_size: float
+    inverse_mass_matrix: float
 
 
 def mclmc_find_L_and_step_size(
@@ -47,6 +50,8 @@ def mclmc_find_L_and_step_size(
     desired_energy_var=5e-4,
     trust_in_estimate=1.5,
     num_effective_samples=150,
+    diagonal_preconditioning=True,
+    params=None,
 ):
     """
     Finds the optimal value of the parameters for the MCLMC algorithm.
@@ -73,44 +78,49 @@ def mclmc_find_L_and_step_size(
         The trust in the estimate of optimal stepsize.
     num_effective_samples
         The number of effective samples for the MCMC algorithm.
+    diagonal_preconditioning
+        Whether to do diagonal preconditioning (i.e. a mass matrix)
+    params
+        Initial params to start tuning from (optional)
 
     Returns
     -------
     A tuple containing the final state of the MCMC algorithm and the final hyperparameters.
 
-
-    Examples
+    Example
     -------
-
     .. code::
+        kernel = lambda inverse_mass_matrix : blackjax.mcmc.mclmc.build_kernel(
+        logdensity_fn=logdensity_fn,
+        integrator=integrator,
+        inverse_mass_matrix=inverse_mass_matrix,
+        )
 
-        # Define the kernel function
-        def kernel(x):
-            return x ** 2
-
-        # Define the initial state
-        initial_state = MCMCState(position=0, momentum=1)
-
-        # Generate a random number generator key
-        rng_key = jax.random.key(0)
-
-        # Find the optimal parameters for the MCLMC algorithm
-        final_state, final_params = mclmc_find_L_and_step_size(
+        (
+            blackjax_state_after_tuning,
+            blackjax_mclmc_sampler_params,
+        ) = blackjax.mclmc_find_L_and_step_size(
             mclmc_kernel=kernel,
-            num_steps=1000,
+            num_steps=num_steps,
             state=initial_state,
-            rng_key=rng_key,
-            frac_tune1=0.2,
-            frac_tune2=0.3,
-            frac_tune3=0.1,
-            desired_energy_var=1e-4,
-            trust_in_estimate=2.0,
-            num_effective_samples=200,
+            rng_key=tune_key,
+            diagonal_preconditioning=preconditioning,
         )
     """
     dim = pytree_size(state.position)
-    params = MCLMCAdaptationState(jnp.sqrt(dim), jnp.sqrt(dim) * 0.25)
+    if params is None:
+        params = MCLMCAdaptationState(
+            jnp.sqrt(dim), jnp.sqrt(dim) * 0.25, inverse_mass_matrix=jnp.ones((dim,))
+        )
+
     part1_key, part2_key = jax.random.split(rng_key, 2)
+    total_num_tuning_integrator_steps = 0
+
+    num_steps1, num_steps2 = round(num_steps * frac_tune1), round(
+        num_steps * frac_tune2
+    )
+    num_steps2 += diagonal_preconditioning * (num_steps2 // 3)
+    num_steps3 = round(num_steps * frac_tune3)
 
     state, params = make_L_step_size_adaptation(
         kernel=mclmc_kernel,
@@ -120,14 +130,17 @@ def mclmc_find_L_and_step_size(
         desired_energy_var=desired_energy_var,
         trust_in_estimate=trust_in_estimate,
         num_effective_samples=num_effective_samples,
+        diagonal_preconditioning=diagonal_preconditioning,
     )(state, params, num_steps, part1_key)
+    total_num_tuning_integrator_steps += num_steps1 + num_steps2
 
-    if frac_tune3 != 0:
-        state, params = make_adaptation_L(mclmc_kernel, frac=frac_tune3, Lfactor=0.4)(
-            state, params, num_steps, part2_key
-        )
+    if num_steps3 >= 2:  # at least 2 samples for ESS estimation
+        state, params = make_adaptation_L(
+            mclmc_kernel(params.inverse_mass_matrix), frac=frac_tune3, Lfactor=0.4
+        )(state, params, num_steps, part2_key)
+        total_num_tuning_integrator_steps += num_steps3
 
-    return state, params
+    return state, params, total_num_tuning_integrator_steps
 
 
 def make_L_step_size_adaptation(
@@ -135,11 +148,12 @@ def make_L_step_size_adaptation(
     dim,
     frac_tune1,
     frac_tune2,
+    diagonal_preconditioning,
     desired_energy_var=1e-3,
     trust_in_estimate=1.5,
     num_effective_samples=150,
 ):
-    """Adapts the stepsize and L of the MCLMC kernel. Designed for the unadjusted MCLMC"""
+    """Adapts the stepsize and L of the MCLMC kernel. Designed for unadjusted MCLMC"""
 
     decay_rate = (num_effective_samples - 1.0) / (num_effective_samples + 1.0)
 
@@ -149,13 +163,16 @@ def make_L_step_size_adaptation(
 
         time, x_average, step_size_max = adaptive_state
 
+        rng_key, nan_key = jax.random.split(rng_key)
+
         # dynamics
-        next_state, info = kernel(
+        next_state, info = kernel(params.inverse_mass_matrix)(
             rng_key=rng_key,
             state=previous_state,
             L=params.L,
             step_size=params.step_size,
         )
+
         # step updating
         success, state, step_size_max, energy_change = handle_nans(
             previous_state,
@@ -163,6 +180,7 @@ def make_L_step_size_adaptation(
             params.step_size,
             step_size_max,
             info.energy_change,
+            nan_key,
         )
 
         # Warning: var = 0 if there were nans, but we will give it a very small weight
@@ -185,68 +203,83 @@ def make_L_step_size_adaptation(
         ) * step_size_max  # if the proposed stepsize is above the stepsize where we have seen divergences
         params_new = params._replace(step_size=step_size)
 
-        return state, params_new, params_new, (time, x_average, step_size_max), success
+        adaptive_state = (time, x_average, step_size_max)
 
-    def update_kalman(x, state, outer_weight, success, step_size):
-        """kalman filter to estimate the size of the posterior"""
-        time, x_average, x_squared_average = state
-        weight = outer_weight * step_size * success
-        zero_prevention = 1 - outer_weight
-        x_average = (time * x_average + weight * x) / (
-            time + weight + zero_prevention
-        )  # Update <f(x)> with a Kalman filter
-        x_squared_average = (time * x_squared_average + weight * jnp.square(x)) / (
-            time + weight + zero_prevention
-        )  # Update <f(x)> with a Kalman filter
-        time += weight
-        return (time, x_average, x_squared_average)
-
-    adap0 = (0.0, 0.0, jnp.inf)
+        return state, params_new, adaptive_state, success
 
     def step(iteration_state, weight_and_key):
         """does one step of the dynamics and updates the estimate of the posterior size and optimal stepsize"""
 
-        outer_weight, rng_key = weight_and_key
-        state, params, adaptive_state, kalman_state = iteration_state
-        state, params, params_final, adaptive_state, success = predictor(
+        mask, rng_key = weight_and_key
+        state, params, adaptive_state, streaming_avg = iteration_state
+
+        state, params, adaptive_state, success = predictor(
             state, params, adaptive_state, rng_key
         )
-        position, _ = ravel_pytree(state.position)
-        kalman_state = update_kalman(
-            position, kalman_state, outer_weight, success, params.step_size
+
+        x = ravel_pytree(state.position)[0]
+        # update the running average of x, x^2
+        streaming_avg = incremental_value_update(
+            expectation=jnp.array([x, jnp.square(x)]),
+            incremental_val=streaming_avg,
+            weight=mask * success * params.step_size,
         )
 
-        return (state, params_final, adaptive_state, kalman_state), None
+        return (state, params, adaptive_state, streaming_avg), None
+
+    run_steps = lambda xs, state, params: jax.lax.scan(
+        step,
+        init=(
+            state,
+            params,
+            (0.0, 0.0, jnp.inf),
+            (0.0, jnp.array([jnp.zeros(dim), jnp.zeros(dim)])),
+        ),
+        xs=xs,
+    )[0]
 
     def L_step_size_adaptation(state, params, num_steps, rng_key):
-        num_steps1, num_steps2 = int(num_steps * frac_tune1), int(
+        num_steps1, num_steps2 = round(num_steps * frac_tune1), round(
             num_steps * frac_tune2
         )
-        L_step_size_adaptation_keys = jax.random.split(rng_key, num_steps1 + num_steps2)
+
+        L_step_size_adaptation_keys = jax.random.split(
+            rng_key, num_steps1 + num_steps2 + 1
+        )
+        L_step_size_adaptation_keys, final_key = (
+            L_step_size_adaptation_keys[:-1],
+            L_step_size_adaptation_keys[-1],
+        )
 
         # we use the last num_steps2 to compute the diagonal preconditioner
-        outer_weights = jnp.concatenate((jnp.zeros(num_steps1), jnp.ones(num_steps2)))
-
-        # initial state of the kalman filter
-        kalman_state = (0.0, jnp.zeros(dim), jnp.zeros(dim))
+        mask = jnp.concatenate((jnp.zeros(num_steps1), jnp.ones(num_steps2)))
 
         # run the steps
-        kalman_state = jax.lax.scan(
-            step,
-            init=(state, params, adap0, kalman_state),
-            xs=(outer_weights, L_step_size_adaptation_keys),
-            length=num_steps1 + num_steps2,
-        )[0]
-        state, params, _, kalman_state_output = kalman_state
+        state, params, _, (_, average) = run_steps(
+            xs=(mask, L_step_size_adaptation_keys), state=state, params=params
+        )
 
         L = params.L
         # determine L
-        if num_steps2 != 0.0:
-            _, F1, F2 = kalman_state_output
-            variances = F2 - jnp.square(F1)
+        inverse_mass_matrix = params.inverse_mass_matrix
+        if num_steps2 > 1:
+            x_average, x_squared_average = average[0], average[1]
+            variances = x_squared_average - jnp.square(x_average)
             L = jnp.sqrt(jnp.sum(variances))
 
-        return state, MCLMCAdaptationState(L, params.step_size)
+            if diagonal_preconditioning:
+                inverse_mass_matrix = variances
+                params = params._replace(inverse_mass_matrix=inverse_mass_matrix)
+                L = jnp.sqrt(dim)
+
+                # readjust the stepsize
+                steps = round(num_steps2 / 3)  # we do some small number of steps
+                keys = jax.random.split(final_key, steps)
+                state, params, _, (_, average) = run_steps(
+                    xs=(jnp.ones(steps), keys), state=state, params=params
+                )
+
+        return state, MCLMCAdaptationState(L, params.step_size, inverse_mass_matrix)
 
     return L_step_size_adaptation
 
@@ -255,10 +288,9 @@ def make_adaptation_L(kernel, frac, Lfactor):
     """determine L by the autocorrelations (around 10 effective samples are needed for this to be accurate)"""
 
     def adaptation_L(state, params, num_steps, key):
-        num_steps = int(num_steps * frac)
-        adaptation_L_keys = jax.random.split(key, num_steps)
+        num_steps_3 = round(num_steps * frac)
+        adaptation_L_keys = jax.random.split(key, num_steps_3)
 
-        # run kernel in the normal way
         def step(state, key):
             next_state, _ = kernel(
                 rng_key=key,
@@ -279,23 +311,34 @@ def make_adaptation_L(kernel, frac, Lfactor):
         ess = effective_sample_size(flat_samples[None, ...])
 
         return state, params._replace(
-            L=Lfactor * params.step_size * jnp.mean(num_steps / ess)
+            L=Lfactor * params.step_size * jnp.mean(num_steps_3 / ess)
         )
 
     return adaptation_L
 
 
-def handle_nans(previous_state, next_state, step_size, step_size_max, kinetic_change):
+def handle_nans(
+    previous_state, next_state, step_size, step_size_max, kinetic_change, key
+):
     """if there are nans, let's reduce the stepsize, and not update the state. The
     function returns the old state in this case."""
 
     reduced_step_size = 0.8
     p, unravel_fn = ravel_pytree(next_state.position)
-    nonans = jnp.all(jnp.isfinite(p))
+    q, unravel_fn = ravel_pytree(next_state.momentum)
+    nonans = jnp.logical_and(jnp.all(jnp.isfinite(p)), jnp.all(jnp.isfinite(q)))
     state, step_size, kinetic_change = jax.tree_util.tree_map(
         lambda new, old: jax.lax.select(nonans, jnp.nan_to_num(new), old),
         (next_state, step_size_max, kinetic_change),
         (previous_state, step_size * reduced_step_size, 0.0),
+    )
+
+    state = jax.lax.cond(
+        jnp.isnan(next_state.logdensity),
+        lambda: state._replace(
+            momentum=generate_unit_vector(key, previous_state.position)
+        ),
+        lambda: state,
     )
 
     return nonans, state, step_size, kinetic_change

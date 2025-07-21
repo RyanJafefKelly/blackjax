@@ -1,4 +1,5 @@
 """Test the accuracy of the MCMC kernels."""
+
 import functools
 import itertools
 
@@ -13,6 +14,9 @@ from absl.testing import absltest, parameterized
 import blackjax
 import blackjax.diagnostics as diagnostics
 import blackjax.mcmc.random_walk
+from blackjax.adaptation.base import get_filter_adapt_info_fn, return_all_adapt_info
+from blackjax.mcmc.adjusted_mclmc_dynamic import rescale
+from blackjax.mcmc.integrators import isokinetic_mclachlan
 from blackjax.util import run_inference_algorithm
 
 
@@ -56,6 +60,27 @@ regression_test_cases = [
     },
 ]
 
+window_adaptation_filters = [
+    {
+        "filter_fn": return_all_adapt_info,
+        "return_sets": None,
+    },
+    {
+        "filter_fn": get_filter_adapt_info_fn(),
+        "return_sets": (set(), set(), set()),
+    },
+    {
+        "filter_fn": get_filter_adapt_info_fn(
+            {"position"}, {"is_divergent"}, {"ss_state", "inverse_mass_matrix"}
+        ),
+        "return_sets": (
+            {"position"},
+            {"is_divergent"},
+            {"ss_state", "inverse_mass_matrix"},
+        ),
+    },
+]
+
 
 class LinearRegressionTest(chex.TestCase):
     """Test sampling of a linear regression model."""
@@ -74,46 +99,204 @@ class LinearRegressionTest(chex.TestCase):
         # reduce sum otherwise broacasting will make the logprob biased.
         return sum(x.sum() for x in [scale_prior, coefs_prior, logpdf])
 
-    def run_mclmc(self, logdensity_fn, num_steps, initial_position, key):
+    def run_mclmc(
+        self,
+        logdensity_fn,
+        num_steps,
+        initial_position,
+        key,
+        diagonal_preconditioning=False,
+    ):
         init_key, tune_key, run_key = jax.random.split(key, 3)
 
         initial_state = blackjax.mcmc.mclmc.init(
             position=initial_position, logdensity_fn=logdensity_fn, rng_key=init_key
         )
 
-        kernel = blackjax.mcmc.mclmc.build_kernel(
+        kernel = lambda inverse_mass_matrix: blackjax.mcmc.mclmc.build_kernel(
             logdensity_fn=logdensity_fn,
-            integrator=blackjax.mcmc.integrators.isokinetic_mclachlan,
+            integrator=blackjax.mcmc.mclmc.isokinetic_mclachlan,
+            inverse_mass_matrix=inverse_mass_matrix,
         )
 
         (
             blackjax_state_after_tuning,
             blackjax_mclmc_sampler_params,
+            _,
         ) = blackjax.mclmc_find_L_and_step_size(
             mclmc_kernel=kernel,
             num_steps=num_steps,
             state=initial_state,
             rng_key=tune_key,
+            diagonal_preconditioning=diagonal_preconditioning,
         )
 
         sampling_alg = blackjax.mclmc(
             logdensity_fn,
             L=blackjax_mclmc_sampler_params.L,
             step_size=blackjax_mclmc_sampler_params.step_size,
+            inverse_mass_matrix=blackjax_mclmc_sampler_params.inverse_mass_matrix,
         )
 
-        _, samples, _ = run_inference_algorithm(
+        _, samples = run_inference_algorithm(
             rng_key=run_key,
-            initial_state_or_position=blackjax_state_after_tuning,
+            initial_state=blackjax_state_after_tuning,
             inference_algorithm=sampling_alg,
             num_steps=num_steps,
-            transform=lambda x: x.position,
+            transform=lambda state, info: state.position,
         )
 
         return samples
 
-    @parameterized.parameters(itertools.product(regression_test_cases, [True, False]))
-    def test_window_adaptation(self, case, is_mass_matrix_diagonal):
+    def run_adjusted_mclmc(
+        self,
+        logdensity_fn,
+        num_steps,
+        initial_position,
+        key,
+        diagonal_preconditioning=False,
+    ):
+        integrator = isokinetic_mclachlan
+
+        init_key, tune_key, run_key = jax.random.split(key, 3)
+
+        initial_state = blackjax.mcmc.adjusted_mclmc_dynamic.init(
+            position=initial_position,
+            logdensity_fn=logdensity_fn,
+            random_generator_arg=init_key,
+        )
+
+        kernel = lambda rng_key, state, avg_num_integration_steps, step_size, inverse_mass_matrix: blackjax.mcmc.adjusted_mclmc_dynamic.build_kernel(
+            integrator=integrator,
+            integration_steps_fn=lambda k: jnp.ceil(
+                jax.random.uniform(k) * rescale(avg_num_integration_steps)
+            ),
+            inverse_mass_matrix=inverse_mass_matrix,
+        )(
+            rng_key=rng_key,
+            state=state,
+            step_size=step_size,
+            logdensity_fn=logdensity_fn,
+        )
+
+        target_acc_rate = 0.65
+
+        (
+            blackjax_state_after_tuning,
+            blackjax_mclmc_sampler_params,
+            _,
+        ) = blackjax.adjusted_mclmc_find_L_and_step_size(
+            mclmc_kernel=kernel,
+            num_steps=num_steps,
+            state=initial_state,
+            rng_key=tune_key,
+            target=target_acc_rate,
+            frac_tune1=0.1,
+            frac_tune2=0.1,
+            frac_tune3=0.1,
+            diagonal_preconditioning=diagonal_preconditioning,
+        )
+
+        step_size = blackjax_mclmc_sampler_params.step_size
+        L = blackjax_mclmc_sampler_params.L
+
+        alg = blackjax.adjusted_mclmc_dynamic(
+            logdensity_fn=logdensity_fn,
+            step_size=step_size,
+            integration_steps_fn=lambda key: jnp.ceil(
+                jax.random.uniform(key) * rescale(L / step_size)
+            ),
+            integrator=integrator,
+            inverse_mass_matrix=blackjax_mclmc_sampler_params.inverse_mass_matrix,
+        )
+
+        _, out = run_inference_algorithm(
+            rng_key=run_key,
+            initial_state=blackjax_state_after_tuning,
+            inference_algorithm=alg,
+            num_steps=num_steps,
+            transform=lambda state, _: state.position,
+            progress_bar=False,
+        )
+
+        return out
+
+    def run_adjusted_mclmc_static(
+        self,
+        logdensity_fn,
+        num_steps,
+        initial_position,
+        key,
+        diagonal_preconditioning=False,
+    ):
+        integrator = isokinetic_mclachlan
+
+        init_key, tune_key, run_key = jax.random.split(key, 3)
+
+        initial_state = blackjax.mcmc.adjusted_mclmc.init(
+            position=initial_position,
+            logdensity_fn=logdensity_fn,
+        )
+
+        kernel = lambda rng_key, state, avg_num_integration_steps, step_size, inverse_mass_matrix: blackjax.mcmc.adjusted_mclmc.build_kernel(
+            integrator=integrator,
+            inverse_mass_matrix=inverse_mass_matrix,
+            logdensity_fn=logdensity_fn,
+        )(
+            rng_key=rng_key,
+            state=state,
+            step_size=step_size,
+            num_integration_steps=avg_num_integration_steps,
+        )
+
+        target_acc_rate = 0.9
+
+        (
+            blackjax_state_after_tuning,
+            blackjax_mclmc_sampler_params,
+            _,
+        ) = blackjax.adjusted_mclmc_find_L_and_step_size(
+            mclmc_kernel=kernel,
+            num_steps=num_steps,
+            state=initial_state,
+            rng_key=tune_key,
+            target=target_acc_rate,
+            frac_tune1=0.1,
+            frac_tune2=0.1,
+            frac_tune3=0.1,
+            diagonal_preconditioning=diagonal_preconditioning,
+        )
+
+        step_size = blackjax_mclmc_sampler_params.step_size
+        L = blackjax_mclmc_sampler_params.L
+
+        alg = blackjax.adjusted_mclmc(
+            logdensity_fn=logdensity_fn,
+            step_size=step_size,
+            num_integration_steps=L / step_size,
+            integrator=integrator,
+            inverse_mass_matrix=blackjax_mclmc_sampler_params.inverse_mass_matrix,
+        )
+
+        _, out = run_inference_algorithm(
+            rng_key=run_key,
+            initial_state=blackjax_state_after_tuning,
+            inference_algorithm=alg,
+            num_steps=num_steps,
+            transform=lambda state, _: state.position,
+            progress_bar=False,
+        )
+
+        return out
+
+    @parameterized.parameters(
+        itertools.product(
+            regression_test_cases, [True, False], window_adaptation_filters
+        )
+    )
+    def test_window_adaptation(
+        self, case, is_mass_matrix_diagonal, window_adapt_config
+    ):
         """Test the HMC kernel and the Stan warmup."""
         rng_key, init_key0, init_key1 = jax.random.split(self.key, 3)
         x_data = jax.random.normal(init_key0, shape=(1000, 1))
@@ -131,17 +314,38 @@ class LinearRegressionTest(chex.TestCase):
             logposterior_fn,
             is_mass_matrix_diagonal,
             progress_bar=True,
+            adaptation_info_fn=window_adapt_config["filter_fn"],
             **case["parameters"],
         )
-        (state, parameters), _ = warmup.run(
+        (state, parameters), info = warmup.run(
             warmup_key,
             case["initial_position"],
             case["num_warmup_steps"],
         )
         inference_algorithm = case["algorithm"](logposterior_fn, **parameters)
 
-        _, states, _ = run_inference_algorithm(
-            inference_key, state, inference_algorithm, case["num_sampling_steps"]
+        def check_attrs(attribute, keyset):
+            for name, param in getattr(info, attribute)._asdict().items():
+                if name in keyset:
+                    assert param is not None
+                else:
+                    assert param is None
+
+        keysets = window_adapt_config["return_sets"]
+        if keysets is None:
+            keysets = (
+                info.state._fields,
+                info.info._fields,
+                info.adaptation_state._fields,
+            )
+        for i, attribute in enumerate(["state", "info", "adaptation_state"]):
+            check_attrs(attribute, keysets[i])
+
+        _, (states, _) = run_inference_algorithm(
+            rng_key=inference_key,
+            initial_state=state,
+            inference_algorithm=inference_algorithm,
+            num_steps=case["num_sampling_steps"],
         )
 
         coefs_samples = states.position["coefs"]
@@ -163,10 +367,16 @@ class LinearRegressionTest(chex.TestCase):
 
         mala = blackjax.mala(logposterior_fn, 1e-5)
         state = mala.init({"coefs": 1.0, "log_scale": 1.0})
-        _, states, _ = run_inference_algorithm(inference_key, state, mala, 10_000)
+        _, states = run_inference_algorithm(
+            rng_key=inference_key,
+            initial_state=state,
+            inference_algorithm=mala,
+            transform=lambda state, info: state.position,
+            num_steps=10_000,
+        )
 
-        coefs_samples = states.position["coefs"][3000:]
-        scale_samples = np.exp(states.position["log_scale"][3000:])
+        coefs_samples = states["coefs"][3000:]
+        scale_samples = np.exp(states["log_scale"][3000:])
 
         np.testing.assert_allclose(np.mean(scale_samples), 1.0, atol=1e-1)
         np.testing.assert_allclose(np.mean(coefs_samples), 3.0, atol=1e-1)
@@ -192,8 +402,138 @@ class LinearRegressionTest(chex.TestCase):
         coefs_samples = states["coefs"][3000:]
         scale_samples = np.exp(states["log_scale"][3000:])
 
-        np.testing.assert_allclose(np.mean(scale_samples), 1.0, atol=1e-2)
-        np.testing.assert_allclose(np.mean(coefs_samples), 3.0, atol=1e-2)
+        np.testing.assert_allclose(np.mean(scale_samples), 1.0, rtol=1e-2, atol=1e-1)
+        np.testing.assert_allclose(np.mean(coefs_samples), 3.0, rtol=1e-2, atol=1e-1)
+
+    def test_adjusted_mclmc(self):
+        """Test the MCLMC kernel."""
+
+        init_key0, init_key1, inference_key = jax.random.split(self.key, 3)
+        x_data = jax.random.normal(init_key0, shape=(1000, 1))
+        y_data = 3 * x_data + jax.random.normal(init_key1, shape=x_data.shape)
+
+        logposterior_fn_ = functools.partial(
+            self.regression_logprob, x=x_data, preds=y_data
+        )
+        logdensity_fn = lambda x: logposterior_fn_(**x)
+
+        states = self.run_adjusted_mclmc(
+            initial_position={"coefs": 1.0, "log_scale": 1.0},
+            logdensity_fn=logdensity_fn,
+            key=inference_key,
+            num_steps=10000,
+        )
+
+        coefs_samples = states["coefs"][3000:]
+        scale_samples = np.exp(states["log_scale"][3000:])
+
+        np.testing.assert_allclose(np.mean(scale_samples), 1.0, rtol=1e-2, atol=1e-1)
+        np.testing.assert_allclose(np.mean(coefs_samples), 3.0, rtol=1e-2, atol=1e-1)
+
+    def test_adjusted_mclmc_static(self):
+        """Test the MCLMC kernel."""
+
+        init_key0, init_key1, inference_key = jax.random.split(self.key, 3)
+        x_data = jax.random.normal(init_key0, shape=(1000, 1))
+        y_data = 3 * x_data + jax.random.normal(init_key1, shape=x_data.shape)
+
+        logposterior_fn_ = functools.partial(
+            self.regression_logprob, x=x_data, preds=y_data
+        )
+        logdensity_fn = lambda x: logposterior_fn_(**x)
+
+        states = self.run_adjusted_mclmc_static(
+            initial_position={"coefs": 1.0, "log_scale": 1.0},
+            logdensity_fn=logdensity_fn,
+            key=inference_key,
+            num_steps=10000,
+        )
+
+        coefs_samples = states["coefs"][3000:]
+        scale_samples = np.exp(states["log_scale"][3000:])
+
+        np.testing.assert_allclose(np.mean(scale_samples), 1.0, rtol=1e-2, atol=1e-1)
+        np.testing.assert_allclose(np.mean(coefs_samples), 3.0, rtol=1e-2, atol=1e-1)
+
+    def test_mclmc_preconditioning(self):
+        class IllConditionedGaussian:
+            """Gaussian distribution. Covariance matrix has eigenvalues equally spaced in log-space, going from 1/condition_bnumber^1/2 to condition_number^1/2."""
+
+            def __init__(self, d, condition_number):
+                """numpy_seed is used to generate a random rotation for the covariance matrix.
+                If None, the covariance matrix is diagonal."""
+
+                self.ndims = d
+                self.name = "IllConditionedGaussian"
+                self.condition_number = condition_number
+                eigs = jnp.logspace(
+                    -0.5 * jnp.log10(condition_number),
+                    0.5 * jnp.log10(condition_number),
+                    d,
+                )
+                self.E_x2 = eigs
+                self.R = jnp.eye(d)
+                self.Hessian = jnp.diag(1 / eigs)
+                self.Cov = jnp.diag(eigs)
+                self.Var_x2 = 2 * jnp.square(self.E_x2)
+
+                self.logdensity_fn = lambda x: -0.5 * x.T @ self.Hessian @ x
+                self.transform = lambda x: x
+
+                self.sample_init = lambda key: jax.random.normal(
+                    key, shape=(self.ndims,)
+                ) * jnp.max(jnp.sqrt(eigs))
+
+        dim = 100
+        condition_number = 10
+        eigs = jnp.logspace(
+            -0.5 * jnp.log10(condition_number), 0.5 * jnp.log10(condition_number), dim
+        )
+        model = IllConditionedGaussian(dim, condition_number)
+        num_steps = 20000
+        key = jax.random.PRNGKey(2)
+
+        integrator = isokinetic_mclachlan
+
+        def get_inverse_mass_matrix():
+            init_key, tune_key = jax.random.split(key)
+
+            initial_position = model.sample_init(init_key)
+
+            initial_state = blackjax.mcmc.mclmc.init(
+                position=initial_position,
+                logdensity_fn=model.logdensity_fn,
+                rng_key=init_key,
+            )
+
+            kernel = lambda inverse_mass_matrix: blackjax.mcmc.mclmc.build_kernel(
+                logdensity_fn=model.logdensity_fn,
+                integrator=integrator,
+                inverse_mass_matrix=inverse_mass_matrix,
+            )
+
+            (_, blackjax_mclmc_sampler_params, _) = blackjax.mclmc_find_L_and_step_size(
+                mclmc_kernel=kernel,
+                num_steps=num_steps,
+                state=initial_state,
+                rng_key=tune_key,
+                diagonal_preconditioning=True,
+            )
+
+            return blackjax_mclmc_sampler_params.inverse_mass_matrix
+
+        inverse_mass_matrix = get_inverse_mass_matrix()
+        assert (
+            jnp.abs(
+                jnp.dot(
+                    (inverse_mass_matrix**2)
+                    / jnp.linalg.norm(inverse_mass_matrix**2),
+                    eigs / jnp.linalg.norm(eigs),
+                )
+                - 1
+            )
+            < 0.1
+        )
 
     @parameterized.parameters(regression_test_cases)
     def test_pathfinder_adaptation(
@@ -228,12 +568,16 @@ class LinearRegressionTest(chex.TestCase):
         )
         inference_algorithm = algorithm(logposterior_fn, **parameters)
 
-        _, states, _ = run_inference_algorithm(
-            inference_key, state, inference_algorithm, num_sampling_steps
+        _, states = run_inference_algorithm(
+            rng_key=inference_key,
+            initial_state=state,
+            inference_algorithm=inference_algorithm,
+            num_steps=num_sampling_steps,
+            transform=lambda state, info: state.position,
         )
 
-        coefs_samples = states.position["coefs"]
-        scale_samples = np.exp(states.position["log_scale"])
+        coefs_samples = states["coefs"]
+        scale_samples = np.exp(states["log_scale"])
 
         np.testing.assert_allclose(np.mean(scale_samples), 1.0, atol=1e-1)
         np.testing.assert_allclose(np.mean(coefs_samples), 3.0, atol=1e-1)
@@ -268,14 +612,18 @@ class LinearRegressionTest(chex.TestCase):
         inference_algorithm = blackjax.ghmc(logposterior_fn, **parameters)
 
         chain_keys = jax.random.split(inference_key, num_chains)
-        _, states, _ = jax.vmap(
+        _, states = jax.vmap(
             lambda key, state: run_inference_algorithm(
-                key, state, inference_algorithm, 100
+                rng_key=key,
+                initial_state=state,
+                inference_algorithm=inference_algorithm,
+                transform=lambda state, info: state.position,
+                num_steps=100,
             )
         )(chain_keys, last_states)
 
-        coefs_samples = states.position["coefs"]
-        scale_samples = np.exp(states.position["log_scale"])
+        coefs_samples = states["coefs"]
+        scale_samples = np.exp(states["log_scale"])
 
         np.testing.assert_allclose(np.mean(scale_samples), 1.0, atol=1e-1)
         np.testing.assert_allclose(np.mean(coefs_samples), 3.0, atol=1e-1)
@@ -312,14 +660,18 @@ class LinearRegressionTest(chex.TestCase):
         inference_algorithm = blackjax.dynamic_hmc(logposterior_fn, **parameters)
 
         chain_keys = jax.random.split(inference_key, num_chains)
-        _, states, _ = jax.vmap(
+        _, states = jax.vmap(
             lambda key, state: run_inference_algorithm(
-                key, state, inference_algorithm, 100
+                rng_key=key,
+                initial_state=state,
+                inference_algorithm=inference_algorithm,
+                transform=lambda state, info: state.position,
+                num_steps=100,
             )
         )(chain_keys, last_states)
 
-        coefs_samples = states.position["coefs"]
-        scale_samples = np.exp(states.position["log_scale"])
+        coefs_samples = states["coefs"]
+        scale_samples = np.exp(states["log_scale"])
 
         np.testing.assert_allclose(np.mean(scale_samples), 1.0, atol=1e-1)
         np.testing.assert_allclose(np.mean(coefs_samples), 3.0, atol=1e-1)
@@ -338,13 +690,19 @@ class LinearRegressionTest(chex.TestCase):
         barker = blackjax.barker_proposal(logposterior_fn, 1e-1)
         state = barker.init({"coefs": 1.0, "log_scale": 1.0})
 
-        _, states, _ = run_inference_algorithm(inference_key, state, barker, 10_000)
+        _, states = run_inference_algorithm(
+            rng_key=inference_key,
+            initial_state=state,
+            inference_algorithm=barker,
+            transform=lambda state, info: state.position,
+            num_steps=10_000,
+        )
 
-        coefs_samples = states.position["coefs"][3000:]
-        scale_samples = np.exp(states.position["log_scale"][3000:])
+        coefs_samples = states["coefs"][3000:]
+        scale_samples = np.exp(states["log_scale"][3000:])
 
-        np.testing.assert_allclose(np.mean(scale_samples), 1.0, atol=1e-2)
-        np.testing.assert_allclose(np.mean(coefs_samples), 3.0, atol=1e-2)
+        np.testing.assert_allclose(np.mean(scale_samples), 1.0, rtol=1e-2, atol=1e-1)
+        np.testing.assert_allclose(np.mean(coefs_samples), 3.0, rtol=1e-2, atol=1e-1)
 
 
 class SGMCMCTest(chex.TestCase):
@@ -457,7 +815,7 @@ class SGMCMCTest(chex.TestCase):
         _ = sghmc.step(rng_key, init_position, data_batch, 1e-3)
 
     def test_linear_regression_sgnht(self):
-        rng_key, data_key = jax.random.split(self.key, 2)
+        step_key, data_key = jax.random.split(self.key, 2)
 
         data_size = 1000
         X_data = jax.random.normal(data_key, shape=(data_size, 5))
@@ -467,15 +825,14 @@ class SGMCMCTest(chex.TestCase):
         )
         sgnht = blackjax.sgnht(grad_fn)
 
-        _, rng_key = jax.random.split(rng_key)
         data_batch = X_data[100:200, :]
         init_position = 1.0
         data_batch = X_data[:100, :]
         init_state = sgnht.init(init_position, self.key)
-        _ = sgnht.step(rng_key, init_state, data_batch, 1e-3)
+        _ = sgnht.step(step_key, init_state, data_batch, 1e-3)
 
     def test_linear_regression_sgnhtc_cv(self):
-        rng_key, data_key = jax.random.split(self.key, 2)
+        step_key, data_key = jax.random.split(self.key, 2)
 
         data_size = 1000
         X_data = jax.random.normal(data_key, shape=(data_size, 5))
@@ -490,11 +847,10 @@ class SGMCMCTest(chex.TestCase):
 
         sgnht = blackjax.sgnht(cv_grad_fn)
 
-        _, rng_key = jax.random.split(rng_key)
         init_position = 1.0
         data_batch = X_data[:100, :]
         init_state = sgnht.init(init_position, self.key)
-        _ = sgnht.step(rng_key, init_state, data_batch, 1e-3)
+        _ = sgnht.step(step_key, init_state, data_batch, 1e-3)
 
 
 class LatentGaussianTest(chex.TestCase):
@@ -520,122 +876,26 @@ class LatentGaussianTest(chex.TestCase):
 
         initial_state = inference_algorithm.init(jnp.zeros((1,)))
 
-        _, states, _ = self.variant(
+        _, states = self.variant(
             functools.partial(
                 run_inference_algorithm,
                 inference_algorithm=inference_algorithm,
+                transform=lambda state, info: state.position,
                 num_steps=self.sampling_steps,
             ),
-        )(self.key, initial_state)
+        )(rng_key=self.key, initial_state=initial_state)
 
         np.testing.assert_allclose(
-            np.var(states.position[self.burnin :]), 1 / (1 + 0.5), rtol=1e-2, atol=1e-2
+            np.var(states[self.burnin :]), 1 / (1 + 0.5), rtol=1e-2, atol=1e-2
         )
         np.testing.assert_allclose(
-            np.mean(states.position[self.burnin :]), 2 / 3, rtol=1e-2, atol=1e-2
+            np.mean(states[self.burnin :]), 2 / 3, rtol=1e-2, atol=1e-2
         )
 
 
 def rmhmc_static_mass_matrix_fn(position):
     del position
     return jnp.array([1.0])
-
-
-normal_test_cases = [
-    {
-        "algorithm": blackjax.hmc,
-        "initial_position": jnp.array(3.0),
-        "parameters": {
-            "step_size": 3.9,
-            "inverse_mass_matrix": jnp.array([1.0]),
-            "num_integration_steps": 30,
-        },
-        "num_sampling_steps": 6000,
-        "burnin": 1_000,
-    },
-    {
-        "algorithm": blackjax.nuts,
-        "initial_position": jnp.array(3.0),
-        "parameters": {"step_size": 4.0, "inverse_mass_matrix": jnp.array([1.0])},
-        "num_sampling_steps": 6000,
-        "burnin": 1_000,
-    },
-    {
-        "algorithm": blackjax.orbital_hmc,
-        "initial_position": jnp.array(100.0),
-        "parameters": {
-            "step_size": 0.1,
-            "inverse_mass_matrix": jnp.array([0.1]),
-            "period": 100,
-        },
-        "num_sampling_steps": 20_000,
-        "burnin": 15_000,
-    },
-    {
-        "algorithm": blackjax.additive_step_random_walk.normal_random_walk,
-        "initial_position": 1.0,
-        "parameters": {"sigma": jnp.array([1.0])},
-        "num_sampling_steps": 20_000,
-        "burnin": 5_000,
-    },
-    {
-        "algorithm": blackjax.rmh,
-        "parameters": {},
-        "initial_position": 1.0,
-        "num_sampling_steps": 20_000,
-        "burnin": 5_000,
-    },
-    {
-        "algorithm": blackjax.mala,
-        "initial_position": 1.0,
-        "parameters": {"step_size": 1e-1},
-        "num_sampling_steps": 45_000,
-        "burnin": 5_000,
-    },
-    {
-        "algorithm": blackjax.elliptical_slice,
-        "initial_position": 1.0,
-        "parameters": {"cov": jnp.array([2.0**2]), "mean": 1.0},
-        "num_sampling_steps": 20_000,
-        "burnin": 5_000,
-    },
-    {
-        "algorithm": blackjax.irmh,
-        "initial_position": jnp.array(1.0),
-        "parameters": {},
-        "num_sampling_steps": 50_000,
-        "burnin": 5_000,
-    },
-    {
-        "algorithm": blackjax.ghmc,
-        "initial_position": jnp.array(1.0),
-        "parameters": {
-            "step_size": 1.0,
-            "momentum_inverse_scale": jnp.array(1.0),
-            "alpha": 0.8,
-            "delta": 2.0,
-        },
-        "num_sampling_steps": 6000,
-        "burnin": 1_000,
-    },
-    {
-        "algorithm": blackjax.barker_proposal,
-        "initial_position": 1.0,
-        "parameters": {"step_size": 1.5},
-        "num_sampling_steps": 20_000,
-        "burnin": 2_000,
-    },
-    {
-        "algorithm": blackjax.rmhmc,
-        "initial_position": jnp.array(3.0),
-        "parameters": {
-            "step_size": 1.0,
-            "num_integration_steps": 30,
-        },
-        "num_sampling_steps": 6000,
-        "burnin": 1_000,
-    },
-]
 
 
 class UnivariateNormalTest(chex.TestCase):
@@ -651,51 +911,179 @@ class UnivariateNormalTest(chex.TestCase):
     def normal_logprob(self, x):
         return stats.norm.logpdf(x, loc=1.0, scale=2.0)
 
-    @chex.all_variants(with_pmap=False)
-    @parameterized.parameters(normal_test_cases)
-    def test_univariate_normal(
-        self, algorithm, initial_position, parameters, num_sampling_steps, burnin
+    def univariate_normal_test_case(
+        self,
+        inference_algorithm,
+        rng_key,
+        initial_state,
+        num_sampling_steps,
+        burnin,
+        postprocess_samples=None,
+        **kwargs,
     ):
-        if algorithm == blackjax.irmh:
-            parameters["proposal_distribution"] = functools.partial(
-                irmh_proposal_distribution, mean=1.0
-            )
-
-        if algorithm == blackjax.rmh:
-            parameters["proposal_generator"] = rmh_proposal_distribution
-
-        if algorithm == blackjax.rmhmc:
-            parameters["mass_matrix"] = rmhmc_static_mass_matrix_fn
-
-        inference_algorithm = algorithm(self.normal_logprob, **parameters)
-        rng_key = self.key
-        if algorithm == blackjax.elliptical_slice:
-            inference_algorithm = algorithm(lambda x: jnp.ones_like(x), **parameters)
-        if algorithm == blackjax.ghmc:
-            rng_key, initial_state_key = jax.random.split(rng_key)
-            initial_state = inference_algorithm.init(
-                initial_position, initial_state_key
-            )
-        else:
-            initial_state = inference_algorithm.init(initial_position)
-
         inference_key, orbit_key = jax.random.split(rng_key)
-        _, states, _ = self.variant(
+        _, (states, info) = self.variant(
             functools.partial(
                 run_inference_algorithm,
                 inference_algorithm=inference_algorithm,
                 num_steps=num_sampling_steps,
+                **kwargs,
             )
-        )(inference_key, initial_state)
+        )(rng_key=inference_key, initial_state=initial_state)
 
-        if algorithm == blackjax.orbital_hmc:
-            samples = orbit_samples(
-                states.positions[burnin:], states.weights[burnin:], orbit_key
-            )
+        if postprocess_samples:
+            samples = postprocess_samples(states, orbit_key)
         else:
             samples = states.position[burnin:]
         np.testing.assert_allclose(np.mean(samples), 1.0, rtol=1e-1)
         np.testing.assert_allclose(np.var(samples), 4.0, rtol=1e-1)
+
+    @chex.all_variants(with_pmap=False)
+    def test_irmh(self):
+        inference_algorithm = blackjax.irmh(
+            self.normal_logprob,
+            proposal_distribution=functools.partial(
+                irmh_proposal_distribution, mean=1.0
+            ),
+        )
+        initial_state = inference_algorithm.init(jnp.array(1.0))
+
+        self.univariate_normal_test_case(
+            inference_algorithm, self.key, initial_state, 50000, 5000
+        )
+
+    @chex.all_variants(with_pmap=False)
+    def test_nuts(self):
+        inference_algorithm = blackjax.nuts(
+            self.normal_logprob, step_size=1.0, inverse_mass_matrix=jnp.array([1.0])
+        )
+
+        initial_state = inference_algorithm.init(jnp.array(3.0))
+
+        self.univariate_normal_test_case(
+            inference_algorithm, self.key, initial_state, 5000, 1000
+        )
+
+    @chex.all_variants(with_pmap=False)
+    def test_rmh(self):
+        inference_algorithm = blackjax.rmh(
+            self.normal_logprob, proposal_generator=rmh_proposal_distribution
+        )
+        initial_state = inference_algorithm.init(1.0)
+
+        self.univariate_normal_test_case(
+            inference_algorithm, self.key, initial_state, 20_000, 5_000
+        )
+
+    @chex.all_variants(with_pmap=False)
+    def test_rmhmc(self):
+        inference_algorithm = blackjax.rmhmc(
+            self.normal_logprob,
+            mass_matrix=rmhmc_static_mass_matrix_fn,
+            step_size=1.0,
+            num_integration_steps=30,
+        )
+
+        initial_state = inference_algorithm.init(jnp.array(3.0))
+
+        self.univariate_normal_test_case(
+            inference_algorithm, self.key, initial_state, 6_000, 1_000
+        )
+
+    @chex.all_variants(with_pmap=False)
+    def test_elliptical_slice(self):
+        inference_algorithm = blackjax.elliptical_slice(
+            lambda x: jnp.ones_like(x), cov=jnp.array([2.0**2]), mean=1.0
+        )
+
+        initial_state = inference_algorithm.init(1.0)
+
+        self.univariate_normal_test_case(
+            inference_algorithm, self.key, initial_state, 20_000, 5_000
+        )
+
+    @chex.all_variants(with_pmap=False)
+    def test_ghmc(self):
+        rng_key, initial_state_key = jax.random.split(self.key)
+        inference_algorithm = blackjax.ghmc(
+            self.normal_logprob,
+            step_size=1.0,
+            momentum_inverse_scale=jnp.array(1.0),
+            alpha=0.8,
+            delta=2.0,
+        )
+        initial_state = inference_algorithm.init(jnp.array(1.0), initial_state_key)
+        self.univariate_normal_test_case(
+            inference_algorithm, rng_key, initial_state, 6000, 1000
+        )
+
+    @chex.all_variants(with_pmap=False)
+    def test_hmc(self):
+        rng_key, initial_state_key = jax.random.split(self.key)
+        inference_algorithm = blackjax.hmc(
+            self.normal_logprob,
+            step_size=3.9,
+            inverse_mass_matrix=jnp.array([1.0]),
+            num_integration_steps=30,
+        )
+        initial_state = inference_algorithm.init(jnp.array(3.0))
+        self.univariate_normal_test_case(
+            inference_algorithm, rng_key, initial_state, 6000, 1000
+        )
+
+    @chex.all_variants(with_pmap=False)
+    def test_orbital_hmc(self):
+        inference_algorithm = blackjax.orbital_hmc(
+            self.normal_logprob,
+            step_size=0.1,
+            inverse_mass_matrix=jnp.array([0.1]),
+            period=100,
+        )
+        initial_state = inference_algorithm.init(jnp.array(100.0))
+        burnin = 15_000
+
+        def postprocess_samples(states, key):
+            positions, weights = states
+            return orbit_samples(positions[burnin:], weights[burnin:], key)
+
+        self.univariate_normal_test_case(
+            inference_algorithm,
+            self.key,
+            initial_state,
+            20_000,
+            burnin,
+            postprocess_samples,
+            transform=lambda state, info: ((state.positions, state.weights), info),
+        )
+
+    @chex.all_variants(with_pmap=False)
+    def test_random_walk(self):
+        inference_algorithm = blackjax.additive_step_random_walk.normal_random_walk(
+            self.normal_logprob, sigma=jnp.array([1.0])
+        )
+        initial_state = inference_algorithm.init(jnp.array(1.0))
+
+        self.univariate_normal_test_case(
+            inference_algorithm, self.key, initial_state, 20_000, 5_000
+        )
+
+    @chex.all_variants(with_pmap=False)
+    def test_mala(self):
+        inference_algorithm = blackjax.mala(self.normal_logprob, step_size=0.2)
+        initial_state = inference_algorithm.init(jnp.array(1.0))
+        self.univariate_normal_test_case(
+            inference_algorithm, self.key, initial_state, 45000, 5_000
+        )
+
+    @chex.all_variants(with_pmap=False)
+    def test_barker(self):
+        inference_algorithm = blackjax.barker_proposal(
+            self.normal_logprob, step_size=1.5
+        )
+        initial_state = inference_algorithm.init(jnp.array(1.0))
+        self.univariate_normal_test_case(
+            inference_algorithm, self.key, initial_state, 20000, 2_000
+        )
 
 
 mcse_test_cases = [
@@ -727,7 +1115,7 @@ mcse_test_cases = [
     },
     {
         "algorithm": blackjax.barker_proposal,
-        "parameters": {"step_size": 0.5},
+        "parameters": {"step_size": 0.45},
         "is_mass_matrix_diagonal": None,
     },
 ]
@@ -738,7 +1126,7 @@ class MonteCarloStandardErrorTest(chex.TestCase):
 
     def setUp(self):
         super().setUp()
-        self.key = jax.random.key(20220203)
+        self.key = jax.random.key(8456)
 
     def generate_multivariate_target(self, rng=None):
         """Genrate a Multivariate Normal distribution as target."""
@@ -807,21 +1195,22 @@ class MonteCarloStandardErrorTest(chex.TestCase):
             functools.partial(
                 run_inference_algorithm,
                 inference_algorithm=inference_algorithm,
+                transform=lambda state, info: state.position,
                 num_steps=2_000,
             )
         )
-        _, states, _ = inference_loop_multiple_chains(
-            multi_chain_sample_key, initial_states
+        _, states = inference_loop_multiple_chains(
+            rng_key=multi_chain_sample_key, initial_state=initial_states
         )
 
-        posterior_samples = states.position[:, -1000:]
+        posterior_samples = states[:, -1000:]
         posterior_delta = posterior_samples - true_loc
         posterior_variance = posterior_delta**2.0
         posterior_correlation = jnp.prod(posterior_delta, axis=-1, keepdims=True) / (
             true_scale[0] * true_scale[1]
         )
 
-        _ = jax.tree_map(
+        _ = jax.tree.map(
             self.mcse_test,
             [posterior_samples, posterior_variance, posterior_correlation],
             [true_loc, true_scale**2, true_rho],

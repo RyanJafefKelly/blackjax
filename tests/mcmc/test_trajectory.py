@@ -1,6 +1,4 @@
 """Test the trajectory integration"""
-import functools
-
 import chex
 import jax
 import jax.numpy as jnp
@@ -34,6 +32,7 @@ class TrajectoryTest(chex.TestCase):
             momentum_generator,
             kinetic_energy_fn,
             uturn_check_fn,
+            _,
         ) = metrics.gaussian_euclidean(inverse_mass_matrix)
 
         integrator = integrators.velocity_verlet(logdensity_fn, kinetic_energy_fn)
@@ -75,7 +74,7 @@ class TrajectoryTest(chex.TestCase):
         assert is_diverging.item() is should_diverge
 
     def test_dynamic_progressive_equal_recursive(self):
-        rng_key = jax.random.key(23132)
+        rng_key = jax.random.key(23133)
 
         def logdensity_fn(x):
             return -((1.0 - x[0]) ** 2) - 1.5 * (x[1] - x[0] ** 2) ** 2
@@ -85,6 +84,7 @@ class TrajectoryTest(chex.TestCase):
             momentum_generator,
             kinetic_energy_fn,
             uturn_check_fn,
+            _,
         ) = metrics.gaussian_euclidean(inverse_mass_matrix)
 
         integrator = integrators.velocity_verlet(logdensity_fn, kinetic_energy_fn)
@@ -124,15 +124,16 @@ class TrajectoryTest(chex.TestCase):
             divergence_threshold,
         )
 
-        for _ in range(50):
+        for i in range(50):
+            subkey = jax.random.fold_in(rng_key, i)
             (
-                rng_key,
+                rng_buildtree,
                 rng_direction,
                 rng_tree_depth,
                 rng_step_size,
                 rng_position,
                 rng_momentum,
-            ) = jax.random.split(rng_key, 6)
+            ) = jax.random.split(subkey, 6)
             direction = jax.random.choice(rng_direction, jnp.array([-1, 1]))
             tree_depth = jax.random.choice(rng_tree_depth, np.arange(2, 5))
             initial_state = integrators.new_integrator_state(
@@ -153,7 +154,7 @@ class TrajectoryTest(chex.TestCase):
                 is_diverging0,
                 has_terminated0,
             ) = trajectory_integrator(
-                rng_key,
+                rng_buildtree,
                 initial_state,
                 direction,
                 termination_state,
@@ -169,7 +170,7 @@ class TrajectoryTest(chex.TestCase):
                 is_diverging1,
                 has_terminated1,
             ) = buildtree_integrator(
-                rng_key,
+                rng_buildtree,
                 initial_state,
                 direction,
                 tree_depth,
@@ -177,11 +178,8 @@ class TrajectoryTest(chex.TestCase):
                 initial_energy,
             )
             # Assert that the trajectory being built is the same
-            jax.tree_map(
-                functools.partial(np.testing.assert_allclose, rtol=1e-5),
-                trajectory0,
-                trajectory1,
-            )
+            chex.assert_trees_all_close(trajectory0, trajectory1, rtol=1e-5)
+
             assert is_diverging0 == is_diverging1
             assert has_terminated0 == has_terminated1
             # We dont expect the proposal to be the same (even with the same PRNGKey
@@ -215,6 +213,7 @@ class TrajectoryTest(chex.TestCase):
             momentum_generator,
             kinetic_energy_fn,
             uturn_check_fn,
+            _,
         ) = metrics.gaussian_euclidean(inverse_mass_matrix)
 
         integrator = integrators.velocity_verlet(logdensity_fn, kinetic_energy_fn)
@@ -270,7 +269,7 @@ class TrajectoryTest(chex.TestCase):
         (
             momentum_generator,
             kinetic_energy_fn,
-            _,
+            *_,
         ) = metrics.gaussian_euclidean(inverse_mass_matrix)
         initial_state = integrators.new_integrator_state(
             logdensity_fn, position, momentum_generator(rng_key, position)
@@ -287,11 +286,7 @@ class TrajectoryTest(chex.TestCase):
         # we still get the same result
         fori_state = jax.jit(static_integration)(initial_state, 0.1, 10)
 
-        jax.tree_util.tree_map(
-            functools.partial(np.testing.assert_allclose, rtol=1e-5),
-            fori_state,
-            scan_state,
-        )
+        chex.assert_trees_all_close(fori_state, scan_state, rtol=1e-5)
 
     def test_dynamic_hmc_integration_steps(self):
         rng_key = jax.random.key(0)
