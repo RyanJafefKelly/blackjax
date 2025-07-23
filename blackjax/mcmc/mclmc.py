@@ -16,15 +16,17 @@ from typing import Callable, NamedTuple
 
 import jax
 import jax.numpy as jnp
-from jax.flatten_util import ravel_pytree
-from jax.random import normal
 
 from blackjax.base import SamplingAlgorithm
-from blackjax.mcmc.integrators import IntegratorState, isokinetic_mclachlan
+from blackjax.mcmc.integrators import (
+    IntegratorState,
+    isokinetic_mclachlan,
+    with_isokinetic_maruyama,
+)
 from blackjax.types import ArrayLike, PRNGKey
 from blackjax.util import generate_unit_vector, pytree_size
 
-__all__ = ["MCLMCInfo", "init", "build_kernel", "mclmc"]
+__all__ = ["MCLMCInfo", "init", "build_kernel", "as_top_level_api"]
 
 
 class MCLMCInfo(NamedTuple):
@@ -59,7 +61,13 @@ def init(position: ArrayLike, logdensity_fn, rng_key):
     )
 
 
-def build_kernel(logdensity_fn, integrator):
+def build_kernel(
+    logdensity_fn,
+    inverse_mass_matrix,
+    integrator,
+    desired_energy_var_max_ratio=jnp.inf,
+    desired_energy_var=5e-4,
+):
     """Build a HMC kernel.
 
     Parameters
@@ -78,32 +86,56 @@ def build_kernel(logdensity_fn, integrator):
     information about the transition.
 
     """
-    step = integrator(logdensity_fn)
+
+    step = with_isokinetic_maruyama(
+        integrator(logdensity_fn=logdensity_fn, inverse_mass_matrix=inverse_mass_matrix)
+    )
 
     def kernel(
         rng_key: PRNGKey, state: IntegratorState, L: float, step_size: float
     ) -> tuple[IntegratorState, MCLMCInfo]:
         (position, momentum, logdensity, logdensitygrad), kinetic_change = step(
-            state, step_size
+            state, step_size, L, rng_key
         )
 
-        # Langevin-like noise
-        momentum = partially_refresh_momentum(
-            momentum=momentum, rng_key=rng_key, L=L, step_size=step_size
+        energy_error = kinetic_change - logdensity + state.logdensity
+
+        eev_max_per_dim = desired_energy_var_max_ratio * desired_energy_var
+        ndims = pytree_size(position)
+
+        new_state, new_info = jax.lax.cond(
+            jnp.abs(energy_error) > jnp.sqrt(ndims * eev_max_per_dim),
+            lambda: (
+                state,
+                MCLMCInfo(
+                    logdensity=state.logdensity,
+                    energy_change=0.0,
+                    kinetic_change=0.0,
+                ),
+            ),
+            lambda: (
+                IntegratorState(position, momentum, logdensity, logdensitygrad),
+                MCLMCInfo(
+                    logdensity=logdensity,
+                    energy_change=energy_error,
+                    kinetic_change=kinetic_change,
+                ),
+            ),
         )
 
-        return IntegratorState(
-            position, momentum, logdensity, logdensitygrad
-        ), MCLMCInfo(
-            logdensity=logdensity,
-            energy_change=kinetic_change - logdensity + state.logdensity,
-            kinetic_change=kinetic_change,
-        )
+        return new_state, new_info
 
     return kernel
 
 
-class mclmc:
+def as_top_level_api(
+    logdensity_fn: Callable,
+    L,
+    step_size,
+    integrator=isokinetic_mclachlan,
+    inverse_mass_matrix=1.0,
+    desired_energy_var_max_ratio=jnp.inf,
+) -> SamplingAlgorithm:
     """The general mclmc kernel builder (:meth:`blackjax.mcmc.mclmc.build_kernel`, alias `blackjax.mclmc.build_kernel`) can be
     cumbersome to manipulate. Since most users only need to specify the kernel
     parameters at initialization time, we provide a helper function that
@@ -150,47 +182,17 @@ class mclmc:
     A ``SamplingAlgorithm``.
     """
 
-    init = staticmethod(init)
-    build_kernel = staticmethod(build_kernel)
+    kernel = build_kernel(
+        logdensity_fn,
+        inverse_mass_matrix,
+        integrator,
+        desired_energy_var_max_ratio=desired_energy_var_max_ratio,
+    )
 
-    def __new__(  # type: ignore[misc]
-        cls,
-        logdensity_fn: Callable,
-        L,
-        step_size,
-        integrator=isokinetic_mclachlan,
-    ) -> SamplingAlgorithm:
-        kernel = cls.build_kernel(logdensity_fn, integrator)
+    def init_fn(position: ArrayLike, rng_key: PRNGKey):
+        return init(position, logdensity_fn, rng_key)
 
-        def init_fn(position: ArrayLike, rng_key: PRNGKey):
-            return cls.init(position, logdensity_fn, rng_key)
+    def update_fn(rng_key, state):
+        return kernel(rng_key, state, L, step_size)
 
-        def update_fn(rng_key, state):
-            return kernel(rng_key, state, L, step_size)
-
-        return SamplingAlgorithm(init_fn, update_fn)
-
-
-def partially_refresh_momentum(momentum, rng_key, step_size, L):
-    """Adds a small noise to momentum and normalizes.
-
-    Parameters
-    ----------
-    rng_key
-        The pseudo-random number generator key used to generate random numbers.
-    momentum
-        PyTree that the structure the output should to match.
-    step_size
-        Step size
-    L
-        controls rate of momentum change
-
-    Returns
-    -------
-    momentum with random change in angle
-    """
-    m, unravel_fn = ravel_pytree(momentum)
-    dim = m.shape[0]
-    nu = jnp.sqrt((jnp.exp(2 * step_size / L) - 1.0) / dim)
-    z = nu * normal(rng_key, shape=m.shape, dtype=m.dtype)
-    return unravel_fn((m + z) / jnp.linalg.norm(m + z))
+    return SamplingAlgorithm(init_fn, update_fn)

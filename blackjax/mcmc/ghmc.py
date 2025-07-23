@@ -16,6 +16,7 @@ from typing import Callable, NamedTuple
 
 import jax
 import jax.numpy as jnp
+from jax.flatten_util import ravel_pytree
 
 import blackjax.mcmc.hmc as hmc
 import blackjax.mcmc.integrators as integrators
@@ -25,7 +26,7 @@ from blackjax.mcmc.proposal import nonreversible_slice_sampling
 from blackjax.types import ArrayLikeTree, ArrayTree, PRNGKey
 from blackjax.util import generate_gaussian_noise
 
-__all__ = ["GHMCState", "init", "build_kernel", "ghmc"]
+__all__ = ["GHMCState", "init", "build_kernel", "as_top_level_api"]
 
 
 class GHMCState(NamedTuple):
@@ -129,8 +130,8 @@ def build_kernel(
 
         """
 
-        flat_inverse_scale = jax.flatten_util.ravel_pytree(momentum_inverse_scale)[0]
-        momentum_generator, kinetic_energy_fn, _ = metrics.gaussian_euclidean(
+        flat_inverse_scale = ravel_pytree(momentum_inverse_scale)[0]
+        momentum_generator, kinetic_energy_fn, *_ = metrics.gaussian_euclidean(
             flat_inverse_scale**2
         )
 
@@ -185,7 +186,7 @@ def update_momentum(rng_key, state, alpha, momentum_generator):
     """
     position, momentum, *_ = state
 
-    momentum = jax.tree_map(
+    momentum = jax.tree.map(
         lambda prev_momentum, shifted_momentum: prev_momentum * jnp.sqrt(1.0 - alpha)
         + jnp.sqrt(alpha) * shifted_momentum,
         momentum,
@@ -195,7 +196,16 @@ def update_momentum(rng_key, state, alpha, momentum_generator):
     return momentum
 
 
-class ghmc:
+def as_top_level_api(
+    logdensity_fn: Callable,
+    step_size: float,
+    momentum_inverse_scale: ArrayLikeTree,
+    alpha: float,
+    delta: float,
+    *,
+    divergence_threshold: int = 1000,
+    noise_gn: Callable = lambda _: 0.0,
+) -> SamplingAlgorithm:
     """Implements the (basic) user interface for the Generalized HMC kernel.
 
     The Generalized HMC kernel performs a similar procedure to the standard HMC
@@ -239,6 +249,10 @@ class ghmc:
         A PyTree of the same structure as the target PyTree (position) with the
         values used for as a step size for each dimension of the target space in
         the velocity verlet integrator.
+    momentum_inverse_scale
+        Pytree with the same structure as the targeted position variable
+        specifying the per dimension inverse scaling transformation applied
+        to the persistent momentum variable prior to the integration step.
     alpha
         The value defining the persistence of the momentum variable.
     delta
@@ -257,34 +271,20 @@ class ghmc:
     A ``SamplingAlgorithm``.
     """
 
-    init = staticmethod(init)
-    build_kernel = staticmethod(build_kernel)
+    kernel = build_kernel(noise_gn, divergence_threshold)
 
-    def __new__(  # type: ignore[misc]
-        cls,
-        logdensity_fn: Callable,
-        step_size: float,
-        momentum_inverse_scale: ArrayLikeTree,
-        alpha: float,
-        delta: float,
-        *,
-        divergence_threshold: int = 1000,
-        noise_gn: Callable = lambda _: 0.0,
-    ) -> SamplingAlgorithm:
-        kernel = cls.build_kernel(noise_gn, divergence_threshold)
+    def init_fn(position: ArrayLikeTree, rng_key: PRNGKey):
+        return init(position, rng_key, logdensity_fn)
 
-        def init_fn(position: ArrayLikeTree, rng_key: PRNGKey):
-            return cls.init(position, rng_key, logdensity_fn)
+    def step_fn(rng_key: PRNGKey, state):
+        return kernel(
+            rng_key,
+            state,
+            logdensity_fn,
+            step_size,
+            momentum_inverse_scale,
+            alpha,
+            delta,
+        )
 
-        def step_fn(rng_key: PRNGKey, state):
-            return kernel(
-                rng_key,
-                state,
-                logdensity_fn,
-                step_size,
-                momentum_inverse_scale,
-                alpha,
-                delta,
-            )
-
-        return SamplingAlgorithm(init_fn, step_fn)
+    return SamplingAlgorithm(init_fn, step_fn)

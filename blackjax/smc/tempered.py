@@ -11,17 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Callable, NamedTuple
+from typing import Callable, NamedTuple, Optional
 
 import jax
 import jax.numpy as jnp
 
 import blackjax.smc as smc
+import blackjax.smc.from_mcmc as smc_from_mcmc
 from blackjax.base import SamplingAlgorithm
-from blackjax.smc.base import SMCState
+from blackjax.smc.base import update_and_take_last
 from blackjax.types import Array, ArrayLikeTree, ArrayTree, PRNGKey
 
-__all__ = ["TemperedSMCState", "init", "build_kernel"]
+__all__ = ["TemperedSMCState", "init", "build_kernel", "as_top_level_api"]
 
 
 class TemperedSMCState(NamedTuple):
@@ -53,6 +54,8 @@ def build_kernel(
     mcmc_step_fn: Callable,
     mcmc_init_fn: Callable,
     resampling_fn: Callable,
+    update_strategy: Callable = update_and_take_last,
+    update_particles_fn: Optional[Callable] = None,
 ) -> Callable:
     """Build the base Tempered SMC kernel.
 
@@ -90,6 +93,13 @@ def build_kernel(
     information about the transition.
 
     """
+    update_particles = (
+        smc_from_mcmc.build_kernel(
+            mcmc_step_fn, mcmc_init_fn, resampling_fn, update_strategy
+        )
+        if update_particles_fn is None
+        else update_particles_fn
+    )
 
     def kernel(
         rng_key: PRNGKey,
@@ -108,6 +118,9 @@ def build_kernel(
             Current state of the tempered SMC algorithm
         lmbda
             Current value of the tempering parameter
+        mcmc_parameters
+            The parameters of the MCMC step function.  Parameters with leading dimension
+            length of 1 are shared amongst the particles.
 
         Returns
         -------
@@ -127,26 +140,15 @@ def build_kernel(
             tempered_loglikelihood = state.lmbda * loglikelihood_fn(position)
             return logprior + tempered_loglikelihood
 
-        def mcmc_kernel(rng_key, position, step_parameters):
-            state = mcmc_init_fn(position, tempered_logposterior_fn)
-
-            def body_fn(state, rng_key):
-                new_state, info = mcmc_step_fn(
-                    rng_key, state, tempered_logposterior_fn, **step_parameters
-                )
-                return new_state, info
-
-            keys = jax.random.split(rng_key, num_mcmc_steps)
-            last_state, info = jax.lax.scan(body_fn, state, keys)
-            return last_state.position, info
-
-        smc_state, info = smc.base.step(
+        smc_state, info = update_particles(
             rng_key,
-            SMCState(state.particles, state.weights, mcmc_parameters),
-            jax.vmap(mcmc_kernel),
-            jax.vmap(log_weights_fn),
-            resampling_fn,
+            state,
+            num_mcmc_steps,
+            mcmc_parameters,
+            tempered_logposterior_fn,
+            log_weights_fn,
         )
+
         tempered_state = TemperedSMCState(
             smc_state.particles, smc_state.weights, state.lmbda + delta
         )
@@ -156,7 +158,17 @@ def build_kernel(
     return kernel
 
 
-class tempered_smc:
+def as_top_level_api(
+    logprior_fn: Callable,
+    loglikelihood_fn: Callable,
+    mcmc_step_fn: Callable,
+    mcmc_init_fn: Callable,
+    mcmc_parameters: dict,
+    resampling_fn: Callable,
+    num_mcmc_steps: Optional[int] = 10,
+    update_strategy=update_and_take_last,
+    update_particles_fn=None,
+) -> SamplingAlgorithm:
     """Implements the (basic) user interface for the Adaptive Tempered SMC kernel.
 
     Parameters
@@ -170,7 +182,8 @@ class tempered_smc:
     mcmc_init_fn
         The MCMC init function used to build a MCMC state from a particle position.
     mcmc_parameters
-        The parameters of the MCMC step function.
+        The parameters of the MCMC step function.  Parameters with leading dimension
+        length of 1 are shared amongst the particles.
     resampling_fn
         The function used to resample the particles.
     num_mcmc_steps
@@ -182,38 +195,27 @@ class tempered_smc:
 
     """
 
-    init = staticmethod(init)
-    build_kernel = staticmethod(build_kernel)
+    kernel = build_kernel(
+        logprior_fn,
+        loglikelihood_fn,
+        mcmc_step_fn,
+        mcmc_init_fn,
+        resampling_fn,
+        update_strategy,
+        update_particles_fn,
+    )
 
-    def __new__(  # type: ignore[misc]
-        cls,
-        logprior_fn: Callable,
-        loglikelihood_fn: Callable,
-        mcmc_step_fn: Callable,
-        mcmc_init_fn: Callable,
-        mcmc_parameters: dict,
-        resampling_fn: Callable,
-        num_mcmc_steps: int = 10,
-    ) -> SamplingAlgorithm:
-        kernel = cls.build_kernel(
-            logprior_fn,
-            loglikelihood_fn,
-            mcmc_step_fn,
-            mcmc_init_fn,
-            resampling_fn,
+    def init_fn(position: ArrayLikeTree, rng_key=None):
+        del rng_key
+        return init(position)
+
+    def step_fn(rng_key: PRNGKey, state, lmbda):
+        return kernel(
+            rng_key,
+            state,
+            num_mcmc_steps,
+            lmbda,
+            mcmc_parameters,
         )
 
-        def init_fn(position: ArrayLikeTree, rng_key=None):
-            del rng_key
-            return cls.init(position)
-
-        def step_fn(rng_key: PRNGKey, state, lmbda):
-            return kernel(
-                rng_key,
-                state,
-                num_mcmc_steps,
-                lmbda,
-                mcmc_parameters,
-            )
-
-        return SamplingAlgorithm(init_fn, step_fn)  # type: ignore[arg-type]
+    return SamplingAlgorithm(init_fn, step_fn)  # type: ignore[arg-type]

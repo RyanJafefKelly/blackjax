@@ -1,4 +1,5 @@
 """Utility functions for BlackJax."""
+
 from functools import partial
 from typing import Callable, Union
 
@@ -6,10 +7,10 @@ import jax.numpy as jnp
 from jax import jit, lax
 from jax.flatten_util import ravel_pytree
 from jax.random import normal, split
-from jax.tree_util import tree_leaves
+from jax.tree_util import tree_leaves, tree_map
 
-from blackjax.base import Info, SamplingAlgorithm, State, VIAlgorithm
-from blackjax.progress_bar import progress_bar_scan
+from blackjax.base import SamplingAlgorithm, VIAlgorithm
+from blackjax.progress_bar import gen_scan_fn
 from blackjax.types import Array, ArrayLikeTree, ArrayTree, PRNGKey
 
 
@@ -142,12 +143,13 @@ def index_pytree(input_pytree: ArrayLikeTree) -> ArrayTree:
 
 def run_inference_algorithm(
     rng_key: PRNGKey,
-    initial_state_or_position: ArrayLikeTree,
     inference_algorithm: Union[SamplingAlgorithm, VIAlgorithm],
     num_steps: int,
+    initial_state: ArrayLikeTree = None,
+    initial_position: ArrayLikeTree = None,
     progress_bar: bool = False,
-    transform: Callable = lambda x: x,
-) -> tuple[State, State, Info]:
+    transform: Callable = lambda state, info: (state, info),
+) -> tuple:
     """Wrapper to run an inference algorithm.
 
     Note that this utility function does not work for Stochastic Gradient MCMC samplers
@@ -158,9 +160,10 @@ def run_inference_algorithm(
     ----------
     rng_key
         The random state used by JAX's random numbers generator.
-    initial_state_or_position
-        The initial state OR the initial position of the inference algorithm. If an initial position
-        is passed in, the function will automatically convert it into an initial state.
+    initial_state
+        The initial state of the inference algorithm.
+    initial_position
+        The initial position of the inference algorithm. This is used when the initial state is not provided.
     inference_algorithm
         One of blackjax's sampling algorithms or variational inference algorithms.
     num_steps
@@ -168,37 +171,146 @@ def run_inference_algorithm(
     progress_bar
         Whether to display a progress bar.
     transform
-        A transformation of the trace of states to be returned. This is useful for
+        A transformation of the trace of states (and info) to be returned. This is useful for
         computing determinstic variables, or returning a subset of the states.
         By default, the states are returned as is.
 
     Returns
     -------
-    Tuple[State, State, Info]
-        1. The final state of the inference algorithm.
-        2. The trace of states of the inference algorithm (contains the MCMC samples).
-        3. The trace of the info of the inference algorithm for diagnostics.
+        1. The final state.
+        2. The history of states.
     """
-    init_key, sample_key = split(rng_key, 2)
-    try:
-        initial_state = inference_algorithm.init(initial_state_or_position, init_key)
-    except (TypeError, ValueError, AttributeError):
-        # We assume initial_state is already in the right format.
-        initial_state = initial_state_or_position
 
-    keys = split(sample_key, num_steps)
+    if initial_state is None and initial_position is None:
+        raise ValueError(
+            "Either `initial_state` or `initial_position` must be provided."
+        )
+    if initial_state is not None and initial_position is not None:
+        raise ValueError(
+            "Only one of `initial_state` or `initial_position` must be provided."
+        )
 
-    @jit
-    def _one_step(state, xs):
+    if initial_state is None:
+        rng_key, init_key = split(rng_key, 2)
+        initial_state = inference_algorithm.init(initial_position, init_key)
+
+    keys = split(rng_key, num_steps)
+
+    def one_step(state, xs):
         _, rng_key = xs
         state, info = inference_algorithm.step(rng_key, state)
-        return state, (transform(state), info)
+        return state, transform(state, info)
 
-    if progress_bar:
-        one_step = progress_bar_scan(num_steps)(_one_step)
-    else:
-        one_step = _one_step
+    scan_fn = gen_scan_fn(num_steps, progress_bar)
 
-    xs = (jnp.arange(num_steps), keys)
-    final_state, (state_history, info_history) = lax.scan(one_step, initial_state, xs)
-    return final_state, state_history, info_history
+    xs = jnp.arange(num_steps), keys
+    final_state, history = scan_fn(one_step, initial_state, xs)
+
+    return final_state, history
+
+
+def store_only_expectation_values(
+    sampling_algorithm,
+    state_transform=lambda x: x,
+    incremental_value_transform=lambda x: x,
+    burn_in=0,
+):
+    """Takes a sampling algorithm and constructs from it a new sampling algorithm object. The new sampling algorithm has the same
+     kernel but only stores the streaming expectation values of some observables, not the full states; to save memory.
+
+    It saves incremental_value_transform(E[state_transform(x)]) at each step i, where expectation is computed with samples up to i-th sample.
+
+    Example:
+
+    .. code::
+
+         init_key, state_key, run_key = jax.random.split(jax.random.PRNGKey(0),3)
+         model = StandardNormal(2)
+         initial_position = model.sample_init(init_key)
+         initial_state = blackjax.mcmc.mclmc.init(
+             position=initial_position, logdensity_fn=model.logdensity_fn, rng_key=state_key
+         )
+         integrator_type = "mclachlan"
+         L = 1.0
+         step_size = 0.1
+         num_steps = 4
+
+         integrator = map_integrator_type_to_integrator['mclmc'][integrator_type]
+         state_transform = lambda state: state.position
+         memory_efficient_sampling_alg, transform = store_only_expectation_values(
+             sampling_algorithm=sampling_alg,
+             state_transform=state_transform)
+
+         initial_state = memory_efficient_sampling_alg.init(initial_state)
+
+         final_state, trace_at_every_step = run_inference_algorithm(
+
+             rng_key=run_key,
+             initial_state=initial_state,
+             inference_algorithm=memory_efficient_sampling_alg,
+             num_steps=num_steps,
+             transform=transform,
+             progress_bar=True,
+         )
+    """
+
+    def init_fn(state):
+        averaging_state = (0.0, state_transform(state))
+        return (state, averaging_state)
+
+    def update_fn(rng_key, state_and_incremental_val):
+        state, averaging_state = state_and_incremental_val
+        state, info = sampling_algorithm.step(
+            rng_key, state
+        )  # update the state with the sampling algorithm
+        averaging_state = incremental_value_update(
+            state_transform(state),
+            averaging_state,
+            weight=(
+                averaging_state[0] >= burn_in
+            ),  # If we want to eliminate some number of steps as a burn-in
+            zero_prevention=1e-10 * (burn_in > 0),
+        )
+        # update the expectation value with the running average
+        return (state, averaging_state), info
+
+    def transform(state_and_incremental_val, info):
+        (state, (_, incremental_value)) = state_and_incremental_val
+        return incremental_value_transform(incremental_value), info
+
+    return SamplingAlgorithm(init_fn, update_fn), transform
+
+
+def safediv(x, y):
+    return jnp.where(x == 0.0, 0.0, x / y)
+
+
+def incremental_value_update(
+    expectation, incremental_val, weight=1.0, zero_prevention=0.0
+):
+    """Compute the streaming average of a function O(x) using a weight.
+    Parameters:
+    ----------
+        expectation
+            the value of the expectation at the current timestep
+        incremental_val
+            tuple of (total, average) where total is the sum of weights and average is the current average
+        weight
+            weight of the current state
+        zero_prevention
+            small value to prevent division by zero
+    Returns:
+    ----------
+        new streaming average
+    """
+
+    total, average = incremental_val
+    average = tree_map(
+        lambda exp, av: safediv(
+            total * av + weight * exp, (total + weight + zero_prevention)
+        ),
+        expectation,
+        average,
+    )
+    total += weight
+    return total, average

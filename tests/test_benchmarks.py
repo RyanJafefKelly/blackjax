@@ -48,8 +48,11 @@ def run_regression(algorithm, **parameters):
     )
     inference_algorithm = algorithm(logdensity_fn, **parameters)
 
-    _, states, _ = run_inference_algorithm(
-        inference_key, state, inference_algorithm, 10_000
+    _, (states, _) = run_inference_algorithm(
+        rng_key=inference_key,
+        initial_state=state,
+        inference_algorithm=inference_algorithm,
+        num_steps=10_000,
     )
 
     return states

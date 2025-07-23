@@ -23,7 +23,7 @@ import blackjax.smc.tempered as tempered
 from blackjax.base import SamplingAlgorithm
 from blackjax.types import ArrayLikeTree, PRNGKey
 
-__all__ = ["build_kernel", "adaptive_tempered_smc"]
+__all__ = ["build_kernel", "init", "as_top_level_api"]
 
 
 def build_kernel(
@@ -34,6 +34,7 @@ def build_kernel(
     resampling_fn: Callable,
     target_ess: float,
     root_solver: Callable = solver.dichotomy,
+    **extra_parameters,
 ) -> Callable:
     r"""Build a Tempered SMC step using an adaptive schedule.
 
@@ -88,6 +89,7 @@ def build_kernel(
         mcmc_step_fn,
         mcmc_init_fn,
         resampling_fn,
+        **extra_parameters,
     )
 
     def kernel(
@@ -103,7 +105,21 @@ def build_kernel(
     return kernel
 
 
-class adaptive_tempered_smc:
+init = tempered.init
+
+
+def as_top_level_api(
+    logprior_fn: Callable,
+    loglikelihood_fn: Callable,
+    mcmc_step_fn: Callable,
+    mcmc_init_fn: Callable,
+    mcmc_parameters: dict,
+    resampling_fn: Callable,
+    target_ess: float,
+    root_solver: Callable = solver.dichotomy,
+    num_mcmc_steps: int = 10,
+    **extra_parameters,
+) -> SamplingAlgorithm:
     """Implements the (basic) user interface for the Adaptive Tempered SMC kernel.
 
     Parameters
@@ -117,7 +133,8 @@ class adaptive_tempered_smc:
     mcmc_init_fn
         The MCMC init function used to build a MCMC state from a particle position.
     mcmc_parameters
-        The parameters of the MCMC step function.
+        The parameters of the MCMC step function.  Parameters with leading dimension
+        length of 1 are shared amongst the particles.
     resampling_fn
         The function used to resample the particles.
     target_ess
@@ -133,42 +150,27 @@ class adaptive_tempered_smc:
     A ``SamplingAlgorithm``.
 
     """
+    kernel = build_kernel(
+        logprior_fn,
+        loglikelihood_fn,
+        mcmc_step_fn,
+        mcmc_init_fn,
+        resampling_fn,
+        target_ess,
+        root_solver,
+        **extra_parameters,
+    )
 
-    init = staticmethod(tempered.init)
-    build_kernel = staticmethod(build_kernel)
+    def init_fn(position: ArrayLikeTree, rng_key=None):
+        del rng_key
+        return init(position)
 
-    def __new__(  # type: ignore[misc]
-        cls,
-        logprior_fn: Callable,
-        loglikelihood_fn: Callable,
-        mcmc_step_fn: Callable,
-        mcmc_init_fn: Callable,
-        mcmc_parameters: dict,
-        resampling_fn: Callable,
-        target_ess: float,
-        root_solver: Callable = solver.dichotomy,
-        num_mcmc_steps: int = 10,
-    ) -> SamplingAlgorithm:
-        kernel = cls.build_kernel(
-            logprior_fn,
-            loglikelihood_fn,
-            mcmc_step_fn,
-            mcmc_init_fn,
-            resampling_fn,
-            target_ess,
-            root_solver,
+    def step_fn(rng_key: PRNGKey, state):
+        return kernel(
+            rng_key,
+            state,
+            num_mcmc_steps,
+            mcmc_parameters,
         )
 
-        def init_fn(position: ArrayLikeTree, rng_key=None):
-            del rng_key
-            return cls.init(position)
-
-        def step_fn(rng_key: PRNGKey, state):
-            return kernel(
-                rng_key,
-                state,
-                num_mcmc_steps,
-                mcmc_parameters,
-            )
-
-        return SamplingAlgorithm(init_fn, step_fn)
+    return SamplingAlgorithm(init_fn, step_fn)
