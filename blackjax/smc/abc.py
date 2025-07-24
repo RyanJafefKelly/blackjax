@@ -260,6 +260,7 @@ def default_stopping(state: SMCABCState, info: SMCABCInfo, eps_min=1e-3, acc_min
 def abc_step(
     rng_key: PRNGKey,
     state: SMCABCState,
+    R_cur: int,
     *,
     simulate_fn: Callable[[PRNGKey, ArrayTree], ArrayTree],
     distance_fn: Callable[[ArrayTree], Array],
@@ -273,9 +274,9 @@ def abc_step(
     """
     # --- unpack ----------------------------------------------------------------
     N = state.weights.shape[0]
-    Na = int(jnp.floor(alpha * N))
+    Na = int(alpha * N)
     N_alive = N - Na
-    R_cur = state.R
+    # R_cur = state.R
 
     # --- 1. discard α N worst by distance --------------------------------------
     sort_idx = jnp.argsort(state.distances)
@@ -346,8 +347,8 @@ def abc_step(
     p_acc = jnp.mean(acc_matrix)
     R_next = jnp.maximum(
         1, jnp.ceil(jnp.log(c) / jnp.log(jnp.clip(1.0 - p_acc, 1e-12, 1.0)))
-    ).astype(int)
-    num_moved = jnp.sum(jnp.any(acc_matrix, axis=1))
+    ).astype(jnp.int32)
+    num_moved = num_moved = jnp.sum(jnp.any(acc_matrix, axis=1)).astype(jnp.int32)
 
     # --- 5. recompute distances for moved set ----------------------------------
     rng_sim_keys = jax.random.split(rng_key, Na)
@@ -365,17 +366,17 @@ def abc_step(
     new_state = SMCABCState(
         particles=new_particles,
         weights=new_weights,
-        epsilon=float(epsilon_next),
+        epsilon=epsilon_next,
         distances=new_distances,
-        R=int(R_next),
+        R=R_next,
         cov_rw=cov_rw,
     )
 
     info = SMCABCInfo(
         ancestors=resampled_idx,
-        acceptance_rate=float(p_acc),
-        num_moved=int(num_moved),
-        R_next=int(R_next),
+        acceptance_rate=p_acc,
+        num_moved=num_moved,
+        R_next=R_next,
     )
     return new_state, info
 
