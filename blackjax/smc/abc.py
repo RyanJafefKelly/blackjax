@@ -32,6 +32,8 @@ class SMCABCInfo(NamedTuple):
     acceptance_rate: float  # mean acceptance in the MCMC move
     num_moved: int
     R_next: int
+    num_simulations: int
+    B_SIM: int = 1  # number of simulations per MCMC move
 
 
 class Distance:
@@ -267,6 +269,7 @@ def abc_step(
     prior_logpdf: Callable[[ArrayTree], Array],
     alpha: float = 0.5,
     c: float = 0.01,
+    B_sim: int = 1,  # number of simulations per distance computation,
     resampling_fn: Callable = resampling.systematic,
 ) -> tuple[SMCABCState, SMCABCInfo]:
     """
@@ -348,7 +351,9 @@ def abc_step(
     R_next = jnp.maximum(
         1, jnp.ceil(jnp.log(c) / jnp.log(jnp.clip(1.0 - p_acc, 1e-12, 1.0)))
     ).astype(jnp.int32)
-    num_moved = num_moved = jnp.sum(jnp.any(acc_matrix, axis=1)).astype(jnp.int32)
+    num_moved = jnp.sum(jnp.any(acc_matrix, axis=1)).astype(jnp.int32)
+
+    num_sim_step = int(Na * (R_cur + 1) * B_sim)
 
     # --- 5. recompute distances for moved set ----------------------------------
     rng_sim_keys = jax.random.split(rng_key, Na)
@@ -377,6 +382,7 @@ def abc_step(
         acceptance_rate=p_acc,
         num_moved=num_moved,
         R_next=R_next,
+        num_simulations=num_sim_step,
     )
     return new_state, info
 
