@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from hashlib import new
 from typing import Callable, NamedTuple, Optional
 
 import jax
@@ -285,7 +284,7 @@ def abc_step(
     sort_idx = jnp.argsort(state.distances)
     keep_idx = sort_idx[:N_alive]
 
-    alive_particles = jax.tree_map(lambda x: x[keep_idx], state.particles)
+    alive_particles = jax.tree.map(lambda x: x[keep_idx], state.particles)
     alive_particles = alive_particles.reshape(alive_particles.shape[0], -1)
     epsilon_next = jnp.max(state.distances[keep_idx])  # next ε
     alive_distances = state.distances[keep_idx]
