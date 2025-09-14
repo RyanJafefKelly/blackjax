@@ -274,13 +274,12 @@ def abc_step(
     """
     Replenishment SMC‑ABC step (Algorithms 1 & 2, Drovandi & Pettitt 2011).
     """
-    # --- unpack ----------------------------------------------------------------
     N = state.weights.shape[0]
     Na = int(alpha * N)
     N_alive = N - Na
     # R_cur = state.R
 
-    # --- 1. discard α N worst by distance --------------------------------------
+    # discard α N worst by distance
     sort_idx = jnp.argsort(state.distances)
     keep_idx = sort_idx[:N_alive]
 
@@ -294,7 +293,7 @@ def abc_step(
     # alive_distances = jax.vmap(distance_fn)(live_summaries)
     # epsilon_next = float(jnp.max(alive_distances))
 
-    # --- 2. adaptive proposal covariance --------------------------------------
+    # adaptive proposal covariance
     centred = alive_particles - alive_particles.mean(0)
     cov_rw = (centred.T @ centred) / (N_alive - 1)
 
@@ -310,15 +309,12 @@ def abc_step(
     chol_S = jnp.linalg.cholesky(jnp.atleast_2d(cov_rw))
     # chol_S = jnp.linalg.cholesky(cov_rw + 1e-6 * jnp.eye(cov_rw.shape[0]))
 
-    # --- 3. resample dropped slice --------------------------------------------
+    # resample dropped slice
     rng_key, k_resample, k_mcmc = jax.random.split(rng_key, 3)
     resampled_idx = resampling_fn(k_resample, jnp.ones(N_alive) / N_alive, Na)
     proposal_particles = alive_particles[resampled_idx]  # (Na, d)
 
-    # --- 4. R_cur Metropolis moves per resampled particle ---------------------
-    keys_move = jax.random.split(k_mcmc, Na * R_cur).reshape(
-        Na, R_cur, 2
-    )  # (Na, R_cur, 2)
+    # R_cur Metropolis moves per resampled particle
 
     def mh_one(key, theta_old):
         key_prop, key_sim, key_u = jax.random.split(key, 3)
@@ -342,9 +338,10 @@ def abc_step(
         return theta, accepts  # accepts shape (R_cur,)
 
     # vmap over Na (particles) so both inputs lead with axis 0 = Na
-    moved_particles, acc_matrix = jax.vmap(mh_chain)(
-        proposal_particles, keys_move
-    )  # moved_particles (Na, d), acc_matrix (Na, R_cur)
+    keys = jax.random.split(k_mcmc, Na * R_cur)
+    keys_move = keys.reshape((Na, R_cur) + keys.shape[1:])
+    moved_particles, acc_matrix = jax.vmap(mh_chain)(proposal_particles, keys_move)
+    # moved_particles (Na, d), acc_matrix (Na, R_cur)
 
     p_acc = jnp.mean(acc_matrix)
     R_next = jnp.maximum(
@@ -354,7 +351,7 @@ def abc_step(
 
     num_sim_step = int(Na * (R_cur + 1) * B_sim)
 
-    # --- 5. recompute distances for moved set ----------------------------------
+    # recompute distances for moved set
     rng_sim_keys = jax.random.split(rng_key, Na)
     moved_distances = jax.vmap(lambda k, th: distance_fn(simulate_fn(k, th)))(
         rng_sim_keys, moved_particles
@@ -362,7 +359,7 @@ def abc_step(
 
     # moved_distances = jnp.squeeze(moved_distances)
 
-    # --- 6. assemble new population -------------------------------------------
+    # assemble new population
     new_particles = jnp.concatenate([alive_particles, moved_particles], axis=0)
     new_distances = jnp.concatenate([alive_distances, moved_distances], axis=0)
     new_weights = jnp.ones_like(state.weights) / N
