@@ -22,6 +22,8 @@ class SMCABCState(NamedTuple):
     distances: Array  # shape (N,)
     R: int  # ← value to use in the next iteration
     cov_rw: Array | None  # proposal Σ (None at t=0)
+    sim_x: ArrayTree  # raw simulated data per particle
+    summaries: ArrayTree  # simulated summaries per particle
 
 
 class SMCABCInfo(NamedTuple):
@@ -211,7 +213,10 @@ def init(
     particles: ArrayLikeTree,
     epsilon: float,
     distance_fn: Callable[[ArrayTree], Array],
-    simulate_fn: Optional[Callable[[PRNGKey, ArrayTree], ArrayTree]],
+    simulate_fn: Callable[
+        [PRNGKey, ArrayTree], ArrayTree
+    ],  # returns raw x (batched if needed)
+    summary_fn: Callable[[ArrayTree], ArrayTree],
     *,
     initial_R: int = 1,
 ) -> SMCABCState:
@@ -221,21 +226,20 @@ def init(
 
     key, subkey = jax.random.split(key)
     sim_keys = jax.random.split(subkey, N)  # (N,)
-    sims = jax.vmap(simulate_fn)(sim_keys, particles)  # (N,48)
-    # sims = jnp.nan_to_num(sims, nan=0.0)
-    distances = jax.vmap(distance_fn)(sims)
-    weights = jnp.ones(N) / N  # uniform at t = 0
-
-    distances = jnp.squeeze(distances)  # shape (N,)
-    weights = jnp.squeeze(weights)  # shape (N,)
+    x0 = jax.vmap(simulate_fn)(sim_keys, particles)  # raw sims
+    s0 = jax.vmap(summary_fn)(x0)  # summaries
+    d0 = jax.vmap(distance_fn)(s0)  # distances
+    w0 = jnp.ones(N) / N
 
     return SMCABCState(
         particles=particles,
-        weights=weights,
+        weights=jnp.squeeze(w0),
         epsilon=epsilon,
-        distances=distances,
+        distances=jnp.squeeze(d0),
         R=initial_R,
-        cov_rw=None,  # will be set after first discard step
+        cov_rw=None,
+        sim_x=x0,
+        summaries=s0,
     )
 
 
@@ -263,7 +267,8 @@ def abc_step(
     state: SMCABCState,
     R_cur: int,
     *,
-    simulate_fn: Callable[[PRNGKey, ArrayTree], ArrayTree],
+    simulate_fn: Callable[[PRNGKey, ArrayTree], ArrayTree],  # raw x
+    summary_fn: Callable[[ArrayTree], ArrayTree],
     distance_fn: Callable[[ArrayTree], Array],
     prior_logpdf: Callable[[ArrayTree], Array],
     alpha: float = 0.5,
@@ -282,11 +287,11 @@ def abc_step(
     # discard α N worst by distance
     sort_idx = jnp.argsort(state.distances)
     keep_idx = sort_idx[:N_alive]
-
-    alive_particles = jax.tree.map(lambda x: x[keep_idx], state.particles)
-    alive_particles = alive_particles.reshape(alive_particles.shape[0], -1)
-    epsilon_next = jnp.max(state.distances[keep_idx])  # next ε
-    alive_distances = state.distances[keep_idx]
+    alive_particles = state.particles[keep_idx]
+    alive_x = state.sim_x[keep_idx]
+    alive_s = state.summaries[keep_idx]
+    alive_d = state.distances[keep_idx]
+    epsilon_next = jnp.max(alive_d)
     # rng_key, live_key = jax.random.split(rng_key)
     # live_keys = jax.random.split(live_key, N_alive)
     # live_summaries = jax.vmap(simulate_fn)(live_keys, alive_particles)  # (N_alive,48)
@@ -294,83 +299,74 @@ def abc_step(
     # epsilon_next = float(jnp.max(alive_distances))
 
     # adaptive proposal covariance
-    centred = alive_particles - alive_particles.mean(0)
-    cov_rw = (centred.T @ centred) / (N_alive - 1)
-
-    # add ridge for stability
-    # var_diag = jnp.var(alive_particles, axis=0)
-    # eps_ridge = 1e-6 * jnp.maximum(var_diag, 1.0)
-    # cov_rw = cov_rw + jnp.diag(eps_ridge)  # (d,d)
-
-    # d = cov_rw.shape[0]
-    # TODO?  optimal Random‑Walk MH in d dims uses Σ_rw = (2.38²/d) · Σ_emp.
-    # cov_rw *= (2.38**2) / d
-    # chol_S = jnp.linalg.cholesky(cov_rw + 1e-8 * jnp.eye(d))
-    chol_S = jnp.linalg.cholesky(jnp.atleast_2d(cov_rw))
-    # chol_S = jnp.linalg.cholesky(cov_rw + 1e-6 * jnp.eye(cov_rw.shape[0]))
+    centred = alive_particles - alive_particles.mean(0, keepdims=True)
+    cov_rw = (centred.T @ centred) / jnp.maximum(N_alive - 1, 1)
+    # small ridge for stability
+    ridge = 1e-8 * jnp.trace(cov_rw) / jnp.maximum(cov_rw.shape[0], 1)
+    chol_S = jnp.linalg.cholesky(cov_rw + ridge * jnp.eye(cov_rw.shape[0]))
 
     # resample dropped slice
     rng_key, k_resample, k_mcmc = jax.random.split(rng_key, 3)
     resampled_idx = resampling_fn(k_resample, jnp.ones(N_alive) / N_alive, Na)
-    proposal_particles = alive_particles[resampled_idx]  # (Na, d)
+    th0 = alive_particles[resampled_idx]
+    x0 = alive_x[resampled_idx]
+    s0 = alive_s[resampled_idx]
+    d0 = alive_d[resampled_idx]
 
     # R_cur Metropolis moves per resampled particle
 
-    def mh_one(key, theta_old):
-        key_prop, key_sim, key_u = jax.random.split(key, 3)
-        theta_prop = _rw_proposal(key_prop, theta_old, chol_S)
-        rho_prop = distance_fn(simulate_fn(key_sim, theta_prop))
-
-        # NOTE: proposal not included as symmetric, if make general later need to add this in
+    def mh_one(carry, key):
+        th_old, x_old, s_old, d_old = carry
+        k_prop, k_sim, k_u = jax.random.split(key, 3)
+        step = jax.random.normal(k_prop, th_old.shape) @ chol_S.T
+        th_prop = th_old + step
+        x_prop = simulate_fn(k_sim, th_prop)
+        s_prop = summary_fn(x_prop)
+        d_prop = distance_fn(s_prop)
         log_alpha = jnp.where(
-            rho_prop <= epsilon_next,
-            prior_logpdf(theta_prop) - prior_logpdf(theta_old),
+            d_prop <= epsilon_next,
+            prior_logpdf(th_prop) - prior_logpdf(th_old),
             -jnp.inf,
         )
-        u = jax.random.uniform(key_u)
-        accept = jnp.log(u) < jnp.minimum(0.0, log_alpha)
+        accept = jnp.log(jax.random.uniform(k_u)) < jnp.minimum(0.0, log_alpha)
 
-        theta_new = jnp.where(accept, theta_prop, theta_old)
-        return theta_new, accept
+        th_new = jnp.where(accept, th_prop, th_old)
+        x_new = jnp.where(accept, x_prop, x_old)
+        s_new = jnp.where(accept, s_prop, s_old)
+        d_new = jnp.where(accept, d_prop, d_old)
+        return (th_new, x_new, s_new, d_new), accept
 
-    def mh_chain(theta0, keys_R):
-        theta, accepts = jax.lax.scan(lambda th, k: mh_one(k, th), theta0, keys_R)
-        return theta, accepts  # accepts shape (R_cur,)
+    def mh_chain(init_carry, keys_R):
+        (th_f, x_f, s_f, d_f), accepts = jax.lax.scan(mh_one, init_carry, keys_R)
+        return (th_f, x_f, s_f, d_f), accepts
 
-    # vmap over Na (particles) so both inputs lead with axis 0 = Na
     keys = jax.random.split(k_mcmc, Na * R_cur)
     keys_move = keys.reshape((Na, R_cur) + keys.shape[1:])
-    moved_particles, acc_matrix = jax.vmap(mh_chain)(proposal_particles, keys_move)
-    # moved_particles (Na, d), acc_matrix (Na, R_cur)
+    (m_th, m_x, m_s, m_d), acc_matrix = jax.vmap(mh_chain)((th0, x0, s0, d0), keys_move)
 
     p_acc = jnp.mean(acc_matrix)
     R_next = jnp.maximum(
         1, jnp.ceil(jnp.log(c) / jnp.log(jnp.clip(1.0 - p_acc, 1e-12, 1.0)))
     ).astype(jnp.int32)
     num_moved = jnp.sum(jnp.any(acc_matrix, axis=1)).astype(jnp.int32)
-
-    num_sim_step = int(Na * (R_cur + 1) * B_sim)
-
-    # recompute distances for moved set
-    rng_sim_keys = jax.random.split(rng_key, Na)
-    moved_distances = jax.vmap(lambda k, th: distance_fn(simulate_fn(k, th)))(
-        rng_sim_keys, moved_particles
-    )
-
-    # moved_distances = jnp.squeeze(moved_distances)
+    num_sim_step = int(Na * R_cur * B_sim)
 
     # assemble new population
-    new_particles = jnp.concatenate([alive_particles, moved_particles], axis=0)
-    new_distances = jnp.concatenate([alive_distances, moved_distances], axis=0)
-    new_weights = jnp.ones_like(state.weights) / N
+    new_particles = jnp.concatenate([alive_particles, m_th], axis=0)
+    new_x = jnp.concatenate([alive_x, m_x], axis=0)
+    new_s = jnp.concatenate([alive_s, m_s], axis=0)
+    new_d = jnp.concatenate([alive_d, m_d], axis=0)
+    new_w = jnp.ones_like(state.weights) / N
 
     new_state = SMCABCState(
         particles=new_particles,
-        weights=new_weights,
+        weights=new_w,
         epsilon=epsilon_next,
-        distances=new_distances,
+        distances=new_d,
         R=R_next,
         cov_rw=cov_rw,
+        sim_x=new_x,
+        summaries=new_s,
     )
 
     info = SMCABCInfo(
@@ -379,6 +375,7 @@ def abc_step(
         num_moved=num_moved,
         R_next=R_next,
         num_simulations=num_sim_step,
+        B_SIM=B_sim,
     )
     return new_state, info
 
