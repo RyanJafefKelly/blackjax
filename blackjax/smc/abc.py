@@ -292,6 +292,8 @@ def abc_step(
     alive_s = state.summaries[keep_idx]
     alive_d = state.distances[keep_idx]
     epsilon_next = jnp.max(alive_d)
+    epsilon_next = jnp.minimum(epsilon_next, state.epsilon)
+
     # rng_key, live_key = jax.random.split(rng_key)
     # live_keys = jax.random.split(live_key, N_alive)
     # live_summaries = jax.vmap(simulate_fn)(live_keys, alive_particles)  # (N_alive,48)
